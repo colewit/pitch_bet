@@ -1,0 +1,303 @@
+
+import numpy as np
+import pandas as pd
+
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+from matplotlib.colors import Normalize
+from matplotlib.cm import ScalarMappable
+
+
+pd.options.display.max_columns = 100
+pd.set_option('future.no_silent_downcasting', True)
+
+def get_events(df):
+    df['first_pitch'] = np.logical_and(df.at_bat_number==1, df.pitch_number==1)
+    
+    df['day_game_number'] = \
+        df.groupby(['home_team','away_team','game_date'], sort=False)['first_pitch'].transform('cumsum')
+    
+    
+    df['walk'] = np.logical_and(df.balls ==3, df.type=='B')
+    df['walk'] = np.where(df.events.str.contains('interf'),False, df.walk)
+    
+    df['strikeout'] = np.logical_and(df.strikes ==2, np.logical_and(df.type=='S', ~(df.events.isna())))
+    df['strikeout'] = np.where(df.events.str.contains('interf'),False, df.strikeout)
+    
+    df['single'] = df.events=='single'
+    df['double'] = df.events=='double'
+    df['triple'] = df.events=='triple'
+    df['homerun'] = df.events.str.contains('home_run').fillna(False)
+    
+    df['hit'] = (df.single + df.double+df.triple+df.homerun).astype(bool)
+    df['runs'] = df.post_bat_score - df.bat_score
+    return df
+
+
+def get_linear_weights(df):
+    df['player_at_bat_number'] = df\
+        .groupby(['game_date','pitcher','batter','day_game_number'])\
+        .at_bat_number.rank('dense')
+    
+    df = df.sort_values('pitch_number')
+    df['row_number'] = range(len(df))
+
+    df['out'] = ~df.events.isna()*(1-df[['walk','single','homerun','triple','double']].sum(axis=1)).astype(bool)
+    df['end_of_at_bat'] = df[['walk','single','homerun','triple','double', 'out']].sum(axis=1).astype(bool)
+
+
+    df['linear_weight'] = np.where(
+        df.end_of_at_bat,
+        df.walk*.55+df.single*.7+df.double*1+df.triple*1.27+df.homerun*1.65 - .26,
+        np.nan)
+
+        
+    df['linear_weight_if_at_bat_over'] = np.where(df.end_of_at_bat,
+                                            (df.linear_weight + .26).clip(0),
+                                             np.nan)
+
+    df['end_of_ab_linear_weight'] = df\
+        .groupby(['game_date','batter','pitcher','player_at_bat_number'])\
+        .linear_weight_if_at_bat_over.transform('mean')
+
+    df = df[(df.balls<4) & (df.strikes < 3)]
+    
+    counts = df\
+        .groupby(['balls','strikes']).agg(count_value = ('end_of_ab_linear_weight','mean')).reset_index()
+    
+    counts = counts.sort_values('strikes', ascending=False)
+    
+    counts['strike_value'] = -1*counts.groupby('balls').count_value.diff()
+    
+    counts = counts.sort_values('balls', ascending=False)
+    
+    counts['ball_value'] = -1*counts.groupby('strikes').count_value.diff()
+    
+    df = df.merge(counts, how = 'left', on=['balls','strikes'])
+    
+    df['out'] = ~df.events.isna()*(1-df[['walk','single','homerun','triple','double']].sum(axis=1)).astype(bool)
+    df['end_of_at_bat'] = df[['walk','single','homerun','triple','double', 'out']].sum(axis=1).astype(bool)
+
+    df['ball'] = df.description.isin(['ball','blocked_ball','intent_ball','pitchout'])
+    df['strike'] = ~df.ball
+    df['foul'] = df.description.isin(['foul','foul_bunt','foul_pitchout'])
+    
+    df['foul_with_2_strikes'] = np.logical_and(df.foul, df.strikes==2)
+    
+    df['linear_weight'] = np.where(df.end_of_at_bat, 
+                                   df.linear_weight,
+                                   df.strike_value.fillna(0)*df.strike + df.ball_value.fillna(0)*df.ball)
+    
+    df = df.dropna(subset='linear_weight')
+    
+    df['estimated_linear_weight'] = df.estimated_woba_using_speedangle/1.2
+    
+    df['estimated_linear_weight'] = df.estimated_linear_weight.combine_first(df.linear_weight)
+    
+    return df
+    
+def pitch_physics(df, drop_intermediates = True):
+    
+    g_fts = 32.174
+    R_ball = .121
+    mass = 5.125
+    circ = 9.125
+    temp = 72
+    humidity = 50
+    pressure = 29.92
+    temp_c = (5/9)*(temp-32)
+    pressure_mm = (pressure * 1000) / 39.37
+    svp = 4.5841 * np.exp((18.687 - temp_c/234.5) * temp_c/(257.14 + temp_c))
+    rho = (1.2929 * (273 / (temp_c + 273)) * (pressure_mm - .3783 *
+                                              humidity * svp / 100) / 760) * .06261
+    const = 0.07182 * rho * (5.125 / mass) * (circ / 9.125)**2
+    
+    df['release_y'] = 60.5-df.release_extension
+    df['t_back_to_release'] = (-df.vy0-np.sqrt(df.vy0**2-2*df.ay*(50-df.release_y)))/df.ay
+    df['vx_r'] = df.vx0+df.ax*df.t_back_to_release
+    df['vy_r'] = df.vy0+df.ay*df.t_back_to_release
+    df['vz_r'] = df.vz0+df.az*df.t_back_to_release
+    df['t_c'] = (-df.vy_r - np.sqrt(df.vy_r**2 - 2*df.ay*(df.release_y - 17/12))) / df.ay
+    df['calc_x_mvt'] = (df.plate_x-df.release_pos_x-(df.vx_r/df.vy_r)*(17/12-df.release_y))
+    df['calc_z_mvt'] = (df.plate_z-df.release_pos_z-(df.vz_r/df.vy_r)*(17/12-df.release_y))+0.5*g_fts*df.t_c**2
+    
+    
+    df['vx_bar'] = (2 * df.vx_r + df.ax * df.t_c) / 2
+    df['vy_bar'] = (2 * df.vy_r + df.ay * df.t_c) / 2
+    df['vz_bar'] = (2 * df.vz_r + df.az * df.t_c) / 2
+    df['v_bar'] = np.sqrt(df.vx_bar**2 + df.vy_bar**2 + df.vz_bar**2)
+    
+    df['adrag'] = -(df.ax * df.vx_bar + df.ay * df.vy_bar + (df.az + g_fts) * df.vz_bar)/df.v_bar
+    df['amagx'] = df.ax + df.adrag * df.vx_bar/df.v_bar
+    df['amagy'] = df.ay + df.adrag * df.vy_bar/df.v_bar
+    df['amagz'] = df.az + df.adrag * df.vz_bar/df.v_bar + g_fts
+    df['amag'] = np.sqrt(df.amagx**2 + df.amagy**2 + df.amagz**2)
+    
+    df['Cd'] = df.adrag / (df.v_bar**2 * const)
+    df['Cl'] = df.amag / (df.v_bar**2 * const)
+    
+    
+    df['spin_t'] = 78.92*0.4*df.Cl/(1-2.32*df.Cl)*df.v_bar
+    
+    df['phi'] = np.where(df.amagz.fillna(-1)>0,
+                         np.arctan2(df.amagz, -df.amagx) * 180/np.pi,
+                         360+np.arctan2(df.amagz, -df.amagx) * 180/np.pi)
+    
+    df['phi'] = np.where(df.amagz.isna(), np.nan, df.phi)
+    
+    df['tilt'] = np.where(3-(1/30)*df.phi.fillna(0)<=0, 3-(1/30)*df.phi + 12, 3-(1/30)*df.phi)
+    df['tilt'] = np.where(df.phi.isna(), np.nan, df.tilt)
+    
+    df['spin_efficiency'] = df.spin_t/df.release_spin_rate
+    
+    columns_to_drop = ['release_y', 't_back_to_release', 'vx_r', 'vy_r',
+           'vz_r', 't_c', 'calc_x_mvt', 'calc_z_mvt', 'vx_bar', 'vy_bar', 'vz_bar',
+           'v_bar', 'adrag', 'amagx', 'amagy', 'amagz', 'amag', 'Cd', 'Cl',
+           'spin_t', 'phi']
+    if drop_intermediates:
+        df = df.drop(columns=columns_to_drop)
+    return df
+
+def pitcher_specific_metrics(df):
+    df['release_speed_max'] = df.groupby('pitcher').release_speed.transform('max')
+    df['portion_of_max_velo'] = df.release_speed/df.release_speed_max
+    df['velo_percentile_for_pitcher'] = df.groupby('pitcher').release_speed.rank(pct=True)
+    df['armside_horz_break'] = np.where(df.p_throws=='L', -1*df.pfx_x, df.pfx_x)
+    df['armside_tilt'] = np.where(df.p_throws=='L', 12-df.tilt, df.tilt)
+    
+    df['fastball'] = df.pitch_type == 'FF'
+    df['has_fastball'] = df.groupby('pitcher').fastball.transform('max')
+    
+    # if you dont have a 4 seam make more inclusive
+    df['fastball'] = np.where(df.has_fastball, df.fastball, df.pitch_type.isin(['FF','FC','SI']))
+    df['fastball_tilt'] = np.where(df.fastball, df.tilt, np.nan)
+    
+    df['fastball_tilt'] = df.groupby('pitcher').fastball_tilt.transform('mean')
+    df['tilt_off_fb'] = df.tilt - df.fastball_tilt
+    
+    df['fastball_horz_break'] = df.groupby('pitcher').armside_horz_break.transform('mean')
+    df['horz_break_off_fb'] = df.armside_horz_break- df.fastball_horz_break
+    
+    df['fastball_vert_break'] = df.groupby('pitcher').pfx_z.transform('mean')
+    df['vert_break_off_fb'] = df.pfx_z- df.fastball_vert_break
+    return df
+
+
+def divide_rectangle(x1, y1, x2, y2, n_rect = 9):
+    # Calculate width and height of the rectangle
+    width = x2 - x1
+    height = y2 - y1
+
+    side_length = int(np.sqrt(n_rect))
+    # Calculate the size of each sub-rectangle
+    sub_width = width / side_length
+    sub_height = height / side_length
+
+    # Initialize a list to store the coordinates of the sub-rectangles
+    rectangles = []
+    
+    # Iterate over rows and columns to create sub-rectangles
+    for i in range(side_length):
+        for j in range(side_length):
+            # Calculate coordinates of each sub-rectangle
+            sub_x1 = x1 + i * sub_width
+            sub_y1 = y1 + j * sub_height
+            sub_x2 = sub_x1 + sub_width
+            sub_y2 = sub_y1 + sub_height
+            
+            # Append the coordinates to the list of rectangles
+            rectangles.append((sub_x1, sub_y1, sub_x2, sub_y2))
+    
+    return rectangles
+
+
+def plot_rectangles(rectangles, values):
+    fig, ax = plt.subplots()
+    
+    # Normalize the values to map them to colors
+    norm = Normalize(vmin=min(values), vmax=max(values))
+    cmap = plt.get_cmap('coolwarm')  # You can change the colormap here
+    
+    for rectangle, value in zip(rectangles[::-1], values[::-1]):
+        
+        x1, y1, x2, y2 = rectangle
+
+        width = x2 - x1
+        height = y2 - y1
+        color = cmap(norm(value))
+        rect = Rectangle((x1, y1), width, height, edgecolor='black', facecolor=color)
+        ax.add_patch(rect)
+    
+    # Add colorbar
+    sm = ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax)
+    cbar.set_label('Values')
+    
+    ax.set_aspect('equal', 'box')
+    ax.autoscale()
+    plt.xlabel('X')
+    plt.ylabel('Y')
+    plt.title('Rectangles')
+
+    plt.xlim((-1.5,1.5))
+    plt.ylim((1,4))
+    
+
+def plot_strike_zone(df, plot_points=True,balls = None, strikes = None):
+
+    x1 = -.83
+    x2 = .83
+    y1 = 1.58
+    y2 = 3.41
+    sub_rectangles = divide_rectangle(x1, y1, x2, y2, n_rect=9)
+    sub_rectangles_outside = divide_rectangle(5*x1, y1-2, 5*x2, y2+2, n_rect=4)
+
+    if balls is not None:
+        df = df[df.balls==balls]
+    if strikes is not None:
+        df = df[df.strikes==strikes]
+    df['plate_x_batter'] = np.where(df.stand=='L', -df.plate_x, df.plate_x)
+    df['plate_z_batter'] = df.plate_z - (df.sz_top - 3.41)
+    pdf = df.groupby('zone')\
+        .agg({'pred_delta_run_expectancy':'mean',
+             'plate_x_batter':'median',
+            'plate_z_batter':'median'}).reset_index()
+    
+    d=pd.DataFrame({'row':list(range(13)), 'zone':[7,4,1,8,5,2,9,6,3,13,11,14,12]})
+    pdf = pdf.merge(d, how='left', on = 'zone').sort_values('row')
+    pdf = pdf.sort_values('row')
+    plot_rectangles(sub_rectangles + sub_rectangles_outside,
+                    values = pdf.pred_delta_run_expectancy.values)
+
+    if plot_points:
+        sdf = df.sample(500)
+        plt.scatter(sdf.plate_x_batter, sdf.plate_z_batter,
+                    c=sdf.pred_delta_run_expectancy, cmap =plt.get_cmap('coolwarm'), norm=slope)
+    plt.show()
+    
+def find_sz_edges(df, edge_tolerance = 2/12):
+    # give 2 inch edge tolerance
+
+    df['on_edge_left'] = df.plate_x.fillna(0).between(-.83 - edge_tolerance, -.83 + edge_tolerance)
+    df['on_edge_right'] = df.plate_x.fillna(0).between(.83 - edge_tolerance, .83 + edge_tolerance)
+    
+    df['on_edge_top'] = df.plate_z.fillna(0).between(df.sz_top - edge_tolerance, df.sz_top + edge_tolerance)
+    df['on_edge_bot'] = df.plate_z.fillna(0).between(df.sz_bot - edge_tolerance, df.sz_bot + edge_tolerance)
+    
+    df['on_edge_inside'] = np.where(df.stand=='L', df.on_edge_right, df.on_edge_left)
+    df['on_edge_outside'] = np.where(df.stand=='R', df.on_edge_right, df.on_edge_left)
+    
+    df['on_low_inside_corner'] = np.logical_and(df.on_edge_inside, df.on_edge_top)
+    df['on_low_outside_corner'] = np.logical_and(df.on_edge_outside, df.on_edge_top)
+    
+    df['on_high_inside_corner'] = np.logical_and(df.on_edge_inside, df.on_edge_bot)
+    df['on_high_outside_corner'] = np.logical_and(df.on_edge_outside, df.on_edge_bot)
+    
+    df['on_edge'] = df[['on_edge_top','on_edge_bot','on_edge_left','on_edge_right']].sum(axis=1).astype(bool)
+    df['on_corner'] = df[['on_high_outside_corner','on_high_inside_corner',
+                          'on_low_outside_corner','on_low_inside_corner']].sum(axis=1).astype(bool)
+    
+    return df
+
+
