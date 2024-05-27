@@ -1,4 +1,3 @@
-
 import pandas as pd
 import numpy as np
 
@@ -6,13 +5,27 @@ from prepare_pitch_values import build_rolling_df
 import xgboost as xgb
 from sklearn.preprocessing import OneHotEncoder
 
+
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.decomposition import PCA
+
+
+# I think no leaks. So this is the most minimal set that
+# all seem to have leakers
+#pred_columns = [x for x in pred_columns_og
+#               if 'last' not in x and 'matchup' not in x
+#               and 'this_inning' not in x and 'today' not in x]
+
+
 def setup_adaptive_smoothing_model(imputed_train_data, 
                                    one_hot_encoder,
                                    num_classes=6,
                                    alpha = 1,
                                    smoothing_prior = None,
                                    categorical_columns=['last_ab','batter_last_ab'],
-                                   meta_columns = ['player_name','pitcher','batter', 'game_date']):
+                                   meta_columns = ['player_name','pitcher','batter', 
+                                                   'game_date','inning_topbot','batting_team']):
     
 
     if smoothing_prior is None:
@@ -43,8 +56,11 @@ def setup_adaptive_smoothing_model(imputed_train_data,
     dtrain = xgb.DMatrix(xtrain_enc, label=train_label)
     dtest = xgb.DMatrix(xtest_enc, label = test_label)
     
-    custom_loss_fn = create_custom_loss(train_label,prior=smoothing_prior, alpha=alpha )
-    custom_eval_fn = create_custom_eval_metric(y_test_smoothed,prior=smoothing_prior, alpha=alpha )
+    custom_loss_fn = create_custom_loss(train_label,prior=smoothing_prior,
+                                        alpha=alpha, n_classes = num_classes )
+    
+    custom_eval_fn = create_custom_eval_metric(y_test_smoothed,prior=smoothing_prior, 
+                                               alpha=alpha,n_classes = num_classes)
     
     # Set parameters
     model_params = {
@@ -62,7 +78,7 @@ def setup_adaptive_smoothing_model(imputed_train_data,
                     custom_metric=custom_eval_fn)
     return bst
 
-def create_custom_eval_metric(y_smoothed, alpha, prior):
+def create_custom_eval_metric(y_smoothed, alpha, prior, n_classes):
     def eval_metric(preds, dtest):
         """
         Custom evaluation metric for XGBoost.
@@ -72,7 +88,7 @@ def create_custom_eval_metric(y_smoothed, alpha, prior):
         """
         
         num_classes = y_smoothed.shape[1]
-        preds = preds.reshape(-1, num_classes)
+        preds = preds.reshape(-1, n_classes)
         preds = np.exp(preds - np.max(preds, axis=1, keepdims=True))
         preds /= np.sum(preds, axis=1, keepdims=True)
         
@@ -91,7 +107,7 @@ def empirical_label_smoothing( y_label, prior, alpha, n_classes):
     smoothed_labels = (1 - sum(prior)) * np.eye(n_classes)[y_label] + prior[np.newaxis,:]
     return smoothed_labels
 
-def create_custom_loss(y_train, prior, alpha):
+def create_custom_loss(y_train, prior, alpha, n_classes):
     """
     Creates a custom loss function with closure to access y_train.
     
@@ -123,14 +139,11 @@ def create_custom_loss(y_train, prior, alpha):
 
         loss = -np.sum(smoothed_labels * np.log(y_pred[np.newaxis,:] + 1e-7)) / len(y_train)
         
-        preds = y_pred.reshape(-1, num_classes)
+        preds = y_pred.reshape(-1, n_classes)
         
         # Compute the softmax of the predictions
         preds = np.exp(preds - np.max(preds, axis=1, keepdims=True))
         preds /= np.sum(preds, axis=1, keepdims=True)
-
-        # Calculate cross-entropy loss (replace with efficient vectorized implementation)
-        #loss = -np.sum(smoothed_labels * np.log(preds + 1e-7)) / len(y_train)
         
         # Compute the gradients and hessians
         grad = preds - smoothed_labels
@@ -230,7 +243,7 @@ def cumulative_sum_up_to_not_including_row(column):
 
 def add_state_data(train_data):
     
-    train_data = train_data.sort_values(['game_date', 'inning','pitcher_at_bat_number'])
+    train_data = train_data.sort_values(['game_date', 'team_at_bat_number'])
 
     
     train_data['homerun'] = (train_data.label == 5)
@@ -285,56 +298,421 @@ def add_state_data(train_data):
 
     return train_data
 
+def dist_between_pitchers(df, pitch_distance_df):
+
+    weighted_dist = np.zeros((df.shape[0], df.shape[0]))
+
+        
+    for pt1 in ['CH', 'CU', 'FF_1', 'FF_2','SI', 'SL']:
+
+        
+        wd_for_pitch = []
+        
+        for pt2 in ['CH', 'CU', 'FF_1', 'FF_2','SI', 'SL']:
+
+            if pt1 in ['CU','SL'] and pt2 in ['FF_1','FF_2','SI', 'CH']:
+                continue
+            elif pt2 in ['CU','SL'] and pt1 in ['FF_1','FF_2','SI', 'CH']:
+                continue
+            elif pt1 == 'CH' and pt2 not in ['SI', 'CH']:
+                continue
+            elif pt2 == 'CH' and pt1 not in ['SI', 'CH']:
+                continue
+            
+            curr_dist = np.zeros((df.shape[0],df.shape[0]))
+            
+            for column in ['pred_pitch_value_cmd_RA9_pitch_type',
+                   'pred_pitch_value_stuff_RA9_pitch_type',
+                   'empirical_pitch_value_RA9_pitch_type']:
+               
+                curr_dist += get_distance_matrix(df[f'{column}_{pt1}'],
+                                              df[f'{column}_{pt2}'],
+                                              df[f'is_{pt1}'],
+                                              df[f'is_{pt2}'])
+
+
+            curr_dist *= 1+pitch_distance_df.loc[pt1, pt2]
+            wd_for_pitch.append(curr_dist)
+
+        stacked_matrices = np.stack(wd_for_pitch, axis=0)
+        # Calculate the minimum along the new axis
+        min_matrix = np.min(stacked_matrices, axis=0)
+        
+        weighted_dist += min_matrix
+        
+
+    return weighted_dist
+
+def get_distance_matrix(vals1, vals2, weights1, weights2):
+    """Converts a list of values to a distance matrix using itertools.product and a distance function.
+    
+    Args:
+      vals: A list of values.
+      distance_func: A function that calculates the distance between two values.
+    
+    Returns:
+      A 2D NumPy array representing the distance matrix.
+    """
+    def euclidean_distance(val1, val2):
+        return np.sqrt((val1 - val2) ** 2)
+        
+    # Generate all combinations of pairs from the list
+    
+    weights_arr1 = np.array(weights1)
+    weights_arr2 = np.array(weights2)
+    weights_arr1[np.isnan(weights_arr1)] = 0
+    weights_arr2[np.isnan(weights_arr2)] = 0
+    weight_matrix = weights_arr1[:, np.newaxis] + weights_arr2[np.newaxis, :]
+
+    vals_arr1 = np.array(vals1)
+    vals_arr2 = np.array(vals2)
+    vals_arr1[np.isnan(vals_arr1)] = 0
+    vals_arr2[np.isnan(vals_arr2)] = 0
+
+    distance_matrix = euclidean_distance(vals_arr1[:, np.newaxis], vals_arr2[ np.newaxis,:])
+
+    
+    return distance_matrix * weight_matrix
+
+    
+
+
+def get_neighbors_pitcher(select_column, val_columns, meta_columns, pitch_distance_df):
+    
+    data = train_data[val_columns + meta_columns]
+        
+    data = data.sort_values(['game_date', 'team_at_bat_number'])
+    data['month'] = data.game_date.dt.month
+    data['year'] = data.game_date.dt.year
+    query_df = data.groupby([select_column,'year', 'month']).first().reset_index()
+    
+    data['year'] = data.game_date.dt.year
+    
+    k = 5
+    month_df = {}
+    for month, qdf in query_df.groupby(['year','month']):
+        
+        num_rows = len(qdf)
+
+        distance_matrix =  dist_between_pitchers(qdf, pitch_distance_df)
+        knn = NearestNeighbors(n_neighbors=k)
+    
+        # Fit the model on the data
+        knn.fit(distance_matrix)
+        
+        # Find the k nearest neighbors
+        distances, indices = knn.kneighbors(distance_matrix)
+
+        d={}
+        for (player, idx_set) in zip(qdf[select_column], indices):
+            d[player] = qdf.iloc[idx_set][select_column].values
+    
+        month_df[month]=d
+    return month_df
+ 
+def get_neighbors_batter(select_column, val_columns, meta_columns):
+    
+    '''
+    find the most similar batters up thru the current month
+    '''
+    
+    
+    data = train_data[val_columns + meta_columns].dropna()
+    
+    data = data.sort_values(['game_date', 'team_at_bat_number'])
+    data['month'] = data.game_date.dt.month
+    data['year'] = data.game_date.dt.year
+    query_df = data.groupby([select_column,'month', 'year']).first().reset_index()
+    
+    scaler = MinMaxScaler()
+    
+    k = 5
+    
+    month_df = {}
+    for grp, qdf in query_df.groupby(['year','month']):
+
+        query_vals = scaler.fit_transform(qdf[val_columns])
+        
+        pca=PCA(4)
+        
+        query_vals = pca.fit_transform(query_vals)
+        
+        knn = NearestNeighbors(n_neighbors=k)
+    
+        # Fit the model on the data
+        knn.fit(query_vals)
+        
+        # Find the k nearest neighbors
+        distances, indices = knn.kneighbors(query_vals)
+
+        d={}
+        for (player, idx_set) in zip(qdf[select_column], indices):
+            d[player] = qdf.iloc[idx_set][select_column].values
+    
+        month_df[grp]=d
+    return month_df
+
+def make_neighbor_df(matchup_df, pitcher_d, batter_d):
+    l = []
+
+    # so example is june 1 for G Cole
+    # I go and find all the matchups where
+    # the pitcher is a neighbor of GC and I make sure the date of the matchup
+    # occurs before the first date of the neighbord.
+    for (year, month), sub_d  in pitcher_d.items():
+        for pitcher, grp in sub_d.items():
+        
+            
+            d = matchup_df[np.logical_and(
+                matchup_df.pitcher.isin(grp),
+                matchup_df.date < f'{year}-{month}-1')].copy(deep=True)
+            d['grp_month'] = month
+            d['grp_year'] = year
+            d['grp_pitcher'] = pitcher
+            l.append(d)
+
+    # so pitcher df for Cole now has matchups prior to June 1, it has grp month 6
+    # and group year 2023 and grp pitcher which is Cole's Id
+    pitcher_df = pd.concat(l)
+    
+    
+    l = []
+    for (year, month), sub_d  in batter_d.items():
+        for batter, grp in sub_d.items():
+    
+            d = matchup_df[np.logical_and(
+                matchup_df.batter.isin(grp),
+                matchup_df.date < f'{year}-{month}-1')].copy(deep=True)
+            d['grp_month'] = month
+            d['grp_year'] = year
+            d['grp_batter'] = batter
+            l.append(d)
+    batter_df = pd.concat(l)
+    return batter_df, pitcher_df
+
+
+
+
+def score_matchups(batter_df, pitcher_df):
+
+    # find the woba in all at bats that have occurred prior
+    def agg_bdf(bdf, pitcher_denom):
+    
+        if bdf.empty:
+            return np.nan, 0
+            
+        pitcher_ratio = bdf.woba_pitcher/pitcher_denom
+        batter_ratio = bdf.batter_ratio
+        
+        weights = batter_ratio * pitcher_ratio
+        woba = (weights*bdf.at_bat_woba).sum()/bdf.num_at_bats.sum()
+        num_ab = bdf.num_at_bats.sum()
+        return woba, num_ab
+
+    d = {'batter':[], 'matchup_woba':[], 'pitcher':[], 'grp_matchup_num_ab':[],
+     'grp_matchup_woba':[], 'matchup_num_ab':[], 'month':[],'year':[]}
+
+
+    # now we go thru Cole, and we get his id and month, year = 6,2023
+    for (pitcher, month, year), pdf in tqdm.tqdm(pitcher_df.groupby(['grp_pitcher', 'grp_month','grp_year'])):
+    
+        pitcher_denom = pdf['grp_pitcher_woba'].iloc[0]
+
+        # filter batter df down to the df where month = june and year = 2023
+        filtered_batter_df = batter_df[
+            
+            np.logical_and(batter_df.pitcher.isin(pdf.pitcher.unique()),
+               
+               np.logical_and(
+                   batter_df.grp_batter.isin(unique_batters),
+                   
+                   np.logical_and(
+                       batter_df.grp_month==month,
+                       batter_df.grp_year==year)))]
+
+        # add print / assert here to verify that game_date of the matchup is less than month, year
+        # (in this example less than june 1 2023
+    
+        
+        for idx, (batter, bdf) in enumerate(filtered_batter_df.groupby('grp_batter')):
+    
+            
+            d['batter'].append(batter)
+            d['pitcher'].append(pitcher)
+            d['month'].append(month)
+            d['year'].append(year)
+            
+            
+            woba_grp, num_ab_grp = agg_bdf(bdf, pitcher_denom)
+            d['grp_matchup_woba'].append(woba_grp)
+            d['grp_matchup_num_ab'].append(num_ab_grp)
+    
+            woba, num_ab = agg_bdf(bdf[bdf.is_representative_batter], pitcher_denom)
+            d['matchup_woba'].append(woba)
+            d['matchup_num_ab'].append(num_ab)
+
+
+    matchup_lookup = pd.DataFrame(d)
+    matchup_lookup['month'] = np.where(matchup_lookup.month ==4, 10, matchup_lookup.month -1)
+    matchup_lookup['year'] = np.where(matchup_lookup.month ==4, matchup_lookup.year-1, matchup_lookup.year)
+    
+    matchup_lookup['game_date'] = pd.to_datetime([y+'-'+m for y,m in 
+                              zip(matchup_lookup.year.astype(str),matchup_lookup.month.astype(str))])
+    
+    matchup_lookup.pitcher = matchup_lookup.pitcher.astype(int)
+    matchup_lookup.batter = matchup_lookup.batter.astype(int)
+    return matchup_lookup
+
+
+def setup_batter_pitcher_matchups(train_data, pitches):
+
+        
+    pitches = pitches[['k_pitch_type_adj','effective_speed',
+                       'release_spin_rate','armside_horz_break','pfx_z']]
+    
+    scaler = MinMaxScaler()
+    pitches[['effective_speed', 'release_spin_rate','armside_horz_break','pfx_z']]\
+        = scaler.fit_transform(
+            pitches[['effective_speed', 'release_spin_rate','armside_horz_break','pfx_z']])
+    
+    pitches = pitches.groupby('k_pitch_type_adj').agg('mean')#.reset_index()
+    
+    distances = pdist(pitches, metric='euclidean')
+    
+    # Convert to a square distance matrix
+    distance_matrix = squareform(distances)
+    
+    # Convert the distance matrix to a DataFrame
+    distance_df = pd.DataFrame(distance_matrix, index=pitches.index, columns=pitches.index)
+
+    meta=['game_date','pitcher','label','player_name','time_thru_the_order','batter']
+
+    pitcher_vals = [x for x in train_data.columns if '_pitcher' in x or 'pitch_type' in x or 'is_'==x[:3]]
+    batter_vals = [x for x in train_data.columns if 'batter' in x and 'regressed' in x] + ['woba_batter']
+    
+    pitcher_d = get_neighbors_pitcher('pitcher', pitcher_vals, meta, distance_df)
+    batter_d = get_neighbors_batter('batter', batter_vals, meta)
+    train_data['year'] = train_data.game_date.dt.year
+    train_data['month'] = train_data.game_date.dt.month
+
+    # how matchup went down in a given month between every batter, pitcher combo
+    matchup_df = train_data.groupby(['batter','pitcher','month', 'year'])\
+        .agg(at_bat_woba=('at_bat_woba', 'sum'),
+             num_at_bats=('at_bat_woba',len),
+             woba_batter=('woba_batter','last'),
+             woba_pitcher=('woba_pitcher','last')).reset_index()
+    
+    matchup_df['date'] = [y+'-'+x for x,y in matchup_df[['month','year']].astype(str).values]
+    matchup_df['date'] = pd.to_datetime(matchup_df.date)
+
+    batter_df, pitcher_df = make_neighbor_df(matchup_df, pitcher_d, batter_d)
+
+    def f(x):
+        try:
+            return x[~x.isna()].iloc[0]
+        except:
+            return np.nan
+            
+    batter_df['is_representative_batter'] = \
+        batter_df.batter==batter_df.grp_batter
+    
+    batter_df['grp_batter_woba'] = np.where(
+        batter_df['is_representative_batter'],
+        batter_df.woba_batter,
+        np.nan)
+    
+    batter_df['grp_batter_woba'] = batter_df\
+        .groupby('grp_batter').grp_batter_woba.transform('mean')
+    
+    batter_df['grp_batter_woba'] = batter_df\
+        .groupby('grp_batter').grp_batter_woba.transform(lambda x: x.fillna(np.nanmean(x)))
+    
+    batter_df['grp_mean_batter_woba'] = batter_df\
+        .groupby('grp_batter').woba_batter.transform(f)
+    
+    
+    batter_df['batter_ratio'] = batter_df['grp_mean_batter_woba'] /\
+        batter_df['grp_batter_woba']
+    
+    
+    
+    pitcher_df['is_representative_pitcher'] = \
+        pitcher_df.pitcher==pitcher_df.grp_pitcher
+    
+    pitcher_df['grp_pitcher_woba'] = np.where(
+        pitcher_df['is_representative_pitcher'],
+        pitcher_df.woba_pitcher,
+        np.nan)
+    
+    pitcher_df['grp_pitcher_woba'] = pitcher_df\
+        .groupby('grp_pitcher').grp_pitcher_woba.transform(f)
+    
+    pitcher_df['grp_pitcher_woba'] = pitcher_df\
+        .groupby('grp_pitcher').grp_pitcher_woba.transform(lambda x: x.fillna(np.nanmean(x)))
+    
+    pitcher_df['grp_mean_pitcher_woba'] = pitcher_df\
+        .groupby('grp_pitcher').woba_pitcher.transform('mean')
+    
+    
+    pitcher_df['pitcher_ratio'] = pitcher_df['woba_pitcher']\
+        .combine_first(pitcher_df.grp_mean_pitcher_woba)/pitcher_df['grp_pitcher_woba']
+
+    return score_matchups(batter_df, pitcher_df)
+
 if __name__ == '__main__':
 
 
-    all_pitch_data = pd.read_parquet('pilot_data.parquet')
+    pitch_values = pd.read_parquet('pilot_data.parquet')
+    train_pitches = pd.read_parquet('df_current_season.parquet')
+    
     cols = ['pitcher', 'player_name','game_date','pitcher_at_bat_number','time_thru_the_order','batter']
 
-    cols += [x for x in all_pitch_data.columns if 'whiff' in x or 'called_strike' in x 
+    cols += [x for x in pitch_values.columns if 'whiff' in x or 'called_strike' in x 
              or 'strikeout' in x or 'homerun' in x or 'woba' in x or 'walk' in x or '_RA9' in x]
     
     cols += [ 'is_CU','is_SL','is_FF_2','is_FF_1','is_SI','is_CH']
-    all_pitch_data = all_pitch_data[cols]
+    pitch_values = pitch_values[cols]
 
-    df_2023 = pd.read_parquet('df_current_season.parquet')
+    
 
-    df_2023['k_pitch_type_adj'] = df_2023['k_pitch_type_adj'].astype(str)
-    df_2023.strikeout = np.where(df_2023.end_of_at_bat, df_2023.strikeout, np.nan)
-    df_2023.walk = np.where(df_2023.end_of_at_bat, df_2023.walk, np.nan)
-    df_2023.homerun = np.where(df_2023.end_of_at_bat, df_2023.homerun, np.nan)
-    df_2023.single = np.where(df_2023.end_of_at_bat, df_2023.single, np.nan)
-    df_2023.double = np.where(df_2023.end_of_at_bat, df_2023.double, np.nan)
-    df_2023.triple = np.where(df_2023.end_of_at_bat, df_2023.triple, np.nan)
-    df_2023['field_out'] = 1 - df_2023[['walk','homerun','strikeout','single','double','triple']].max(axis=1)
+    train_pitches['k_pitch_type_adj'] = train_pitches['k_pitch_type_adj'].astype(str)
+    train_pitches.strikeout = np.where(train_pitches.end_of_at_bat, train_pitches.strikeout, np.nan)
+    train_pitches.walk = np.where(train_pitches.end_of_at_bat, train_pitches.walk, np.nan)
+    train_pitches.homerun = np.where(train_pitches.end_of_at_bat, train_pitches.homerun, np.nan)
+    train_pitches.single = np.where(train_pitches.end_of_at_bat, train_pitches.single, np.nan)
+    train_pitches.double = np.where(train_pitches.end_of_at_bat, train_pitches.double, np.nan)
+    train_pitches.triple = np.where(train_pitches.end_of_at_bat, train_pitches.triple, np.nan)
+    train_pitches['field_out'] = \
+        1 - train_pitches[['walk','homerun','strikeout','single','double','triple']].max(axis=1)
     
     
     
-    df_2023['k_pitch_type_adj'] = df_2023['k_pitch_type_adj'].astype(str)
-    df_2023['pitch_type'] = df_2023['pitch_type'].astype(str)
+    train_pitches['k_pitch_type_adj'] = train_pitches['k_pitch_type_adj'].astype(str)
+    train_pitches['pitch_type'] = train_pitches['pitch_type'].astype(str)
     
-    df_2023 = df_2023.sort_values(['pitcher','game_date','at_bat_number','pitch_number'])
-    df_2023['at_bat_change'] = (df_2023.groupby(['pitcher','game_date']).at_bat_number.diff().fillna(0)!=0)
+    train_pitches = train_pitches.sort_values(['pitcher','game_date','at_bat_number','pitch_number'])
+    train_pitches['at_bat_change'] = \
+        (train_pitches.groupby(['pitcher','game_date']).at_bat_number.diff().fillna(0)!=0)
 
-    df_2023['pitcher_at_bat_number'] = df_2023\
+    train_pitches['pitcher_at_bat_number'] = train_pitches\
         .groupby(['pitcher','game_date']).at_bat_change.transform('cumsum') + 1
 
-    df_2023['team_at_bat_number'] = df_2023\
+    train_pitches['team_at_bat_number'] = train_pitches\
         .groupby(['inning_topbot','game_date','home_team']).at_bat_change.transform('cumsum') + 1
     
     # add more state info to the game
-    df_2023['batting_score'] = np.where(
-        df_2023.inning_topbot=='Top', 
-        df_2023.away_score,
-        df_2023.home_score)
+    train_pitches['batting_score'] = np.where(
+        train_pitches.inning_topbot=='Top', 
+        train_pitches.away_score,
+        train_pitches.home_score)
     
-    df_2023['batting_team'] = np.where(
-        df_2023.inning_topbot=='Top', 
-        df_2023.away_team,
-        df_2023.home_team)
+    train_pitches['batting_team'] = np.where(
+        train_pitches.inning_topbot=='Top', 
+        train_pitches.away_team,
+        train_pitches.home_team)
 
-    df_2023['lineup_slot'] = 1 + (df_2023.team_at_bat_number-1)%9
-    df_2023['lineup_slot'] = df_2023.groupby(['batter','game_date'])\
+    train_pitches['lineup_slot'] = 1 + (train_pitches.team_at_bat_number-1)%9
+    train_pitches['lineup_slot'] = train_pitches.groupby(['batter','game_date'])\
         .lineup_slot.transform('first')
 
 
@@ -351,7 +729,7 @@ if __name__ == '__main__':
     min_period = 200
 
     # find rolling performance of batter up to current date
-    batter_by_game = build_rolling_df(df_2023[df_2023.end_of_at_bat], 
+    batter_by_game = build_rolling_df(train_pitches[train_pitches.end_of_at_bat], 
                          roll_columns,
                          sort_columns, 
                          group_columns,
@@ -387,34 +765,34 @@ if __name__ == '__main__':
     
     train_batter_cols = [x for x in batter_by_game.columns if '_batter' in x]
     
-    at_bat_cols = [x for x in all_pitch_data.columns if 'last_9' in x or 'next_3' in x]
+    at_bat_cols = [x for x in pitch_values.columns if 'last_9' in x or 'next_3' in x]
     
     pitcher_meta = ['pitcher','game_date', 'pitcher_at_bat_number', 'batter']
     batter_meta = ['label','pitcher','batter','game_date','pitcher_at_bat_number'] 
     
-    summary_stat_cols = [x for x in all_pitch_data.columns 
+    summary_stat_cols = [x for x in pitch_values.columns 
                   if x not in at_bat_cols
                   and x not in train_batter_cols
                   and x != 'batter' and x != 'pitcher_at_bat_number']
     
     
     
-    train_data = all_pitch_data[at_bat_cols + pitcher_meta ]\
+    train_data = pitch_values[at_bat_cols + pitcher_meta ]\
         .merge(batter_by_game[train_batter_cols + batter_meta],
                how ='left', on = pitcher_meta)
     
     train_data = train_data.merge(
-        df_2023[['inning_topbot','inning','on_1b','on_2b','on_3b',
+        train_pitches[['inning_topbot','inning','on_1b','on_2b','on_3b',
                  'game_date','pitcher_at_bat_number','pitcher',
                  'team_at_bat_number','batting_team','batting_score',
                  'lineup_slot']].drop_duplicates(),
         how = 'left', on = ['game_date','pitcher_at_bat_number','pitcher'])
 
-    all_pitch_data = all_pitch_data.sort_values(['game_date','pitcher_at_bat_number'])
+    pitch_values = pitch_values.sort_values(['game_date','pitcher_at_bat_number'])
 
     # rolling stats at the start of first ab are what you enter the game with
     summary_stat_before_first_pitch_df = \
-        all_pitch_data[summary_stat_cols].groupby(['pitcher','game_date']).first().reset_index()
+        pitch_values[summary_stat_cols].groupby(['pitcher','game_date']).first().reset_index()
     
     train_data = train_data\
         .merge(summary_stat_before_first_pitch_df, how ='left', on = ['pitcher','game_date'])
@@ -471,7 +849,22 @@ if __name__ == '__main__':
     train_data['woba_pitcher'] = train_data.groupby(['game_date','pitcher']).woba_pitcher.shift(1)
 
     train_data = train_data.dropna(subset='label')
-    
+
+    if False:
+
+        matchup_lookup = setup_batter_pitcher_matchups(train_data, pitches)
+        matchup_lookup.to_parquet('matchup_lookup.parquet')
+    else:
+        matchup_lookup = pd.read_parquet('matchup_lookup.parquet')
+        
+    train_data = pd.merge_asof(
+        train_data,
+        matchup_lookup.drop(columns = ['month','year'])
+        .sort_values('game_date'), 
+        by = ['batter','pitcher'],
+        on='game_date',
+        direction='backward')
+
     one_hot_encoder = OneHotEncoder(handle_unknown='ignore')
 
     one_hot_encoder.fit(train_data.head(100000)[['last_ab', 'batter_last_ab']].dropna())

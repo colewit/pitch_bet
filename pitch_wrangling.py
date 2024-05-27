@@ -183,6 +183,14 @@ def pitcher_specific_metrics(df):
     return df
 
 
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+from matplotlib.colors import Normalize
+from matplotlib.cm import ScalarMappable
+
+
+
+
 def divide_rectangle(x1, y1, x2, y2, n_rect = 9):
     # Calculate width and height of the rectangle
     width = x2 - x1

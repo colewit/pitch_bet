@@ -1,6 +1,6 @@
 
 
-pitch_model_train_cutoff = '2020-01-0'
+pitch_model_train_cutoff = '2020-01-01'
 # i dont get to look at anything besides
 xgboost_benchmark_columns = ['stand', 'p_throws', 'balls', 'strikes', 'count_value', 
  'strike_value', 'ball_value']

@@ -103,6 +103,7 @@ def train_xgboost(data, target_column, pred_columns,
                      classification=classification,
                      multiclass = multiclass)
 
+    #xg_model.fit(train_df[pred_columns], train_df[target_column])
     preds = xg_model.predict(test_df.drop(columns = target_column))
 
     if classification:
@@ -294,9 +295,9 @@ def get_context_stats(df, at_bat_cap = 400):
 
 if __name__=='__main__':
 
-    if True:
+    if False:
         
-        df = pd.read_parquet('pitches_by_year')
+        df = pd.read_parquet('pitches_by_season')
     
         df = pitch_physics(df)
         df = find_sz_edges(df, edge_tolerance = 2/12)
@@ -314,11 +315,8 @@ if __name__=='__main__':
             [x for x in df.columns if 'edge' in x or 'corner' in x]
     
         df['pitch_type'] = df.pitch_type.astype('category')
-        
-        # dont need a huge sample as this feature is a pretty easy one to learn
         called_data = df[
-            np.logical_and(df.taken, df.game_date<pitch_model_train_cutoff)]\
-            .sample(50000).dropna(subset=pred_columns)
+            np.logical_and(df.taken, df.game_date<'2023-01-01')].sample(50000).dropna(subset=pred_columns)
 
         xg_model = train_xgboost(called_data, target_column, pred_columns, categorical_columns)
         
@@ -353,14 +351,15 @@ if __name__=='__main__':
 
 
 
-    if False:
+    if True:
 
         print('about to train models with columns')
 
         df['pitch_type'] = df.pitch_type.astype('category')
-
+        
+        print(list(xgboost_pred_columns))
         data = df[['game_date']+xgboost_pred_columns+[xgboost_target_column]]
-        train_data = data[data.game_date < pitch_model_train_cutoff]
+        train_data = data[data.game_date <= pitch_model_train_cutoff]
 
         xg_model_benchmark = train_xgboost(train_data, 
                                  xgboost_target_column, 
@@ -420,60 +419,57 @@ if __name__=='__main__':
     for col in xgboost_categorical_columns:
         df[col] = df[col].astype('category')
         
-    train_data = df[df.game_date>pd.to_datetime(pitch_model_train_cutoff)]
+    df_with_pitch_values = df[df.game_date>pitch_model_train_cutoff]
 
-    train_data['pred_delta_run_expectancy'] = predict_xgboost(xg_model, 
-                                                      train_data, 
+    df_with_pitch_values['pred_delta_run_expectancy'] = predict_xgboost(xg_model, 
+                                                      df_with_pitch_values, 
                                                       xgboost_pred_columns,
                                                       xgboost_categorical_columns)
     
-    train_data['pred_delta_run_expectancy_cmd'] = predict_xgboost(xg_model_cmd, 
-                                                      train_data, 
+    df_with_pitch_values['pred_delta_run_expectancy_cmd'] = predict_xgboost(xg_model_cmd, 
+                                                      df_with_pitch_values, 
                                                       xgboost_pred_columns_cmd_only,
                                                       xgboost_categorical_columns)
 
-    train_data['pred_delta_run_expectancy_stuff'] = predict_xgboost(xg_model_stuff, 
-                                                      train_data, 
+    df_with_pitch_values['pred_delta_run_expectancy_stuff'] = predict_xgboost(xg_model_stuff, 
+                                                      df_with_pitch_values, 
                                                       xgboost_pred_columns_stuff_only,
                                                       ['k_pitch_type_adj','pitch_type'])
 
-    train_data['pred_benchmark'] = predict_xgboost(xg_model_benchmark, 
-                                                      train_data, 
+    df_with_pitch_values['pred_benchmark'] = predict_xgboost(xg_model_benchmark, 
+                                                      df_with_pitch_values, 
                                                       xgboost_benchmark_columns,
                                                       [])
     
-    train_data['dre_above_average'] = \
-        train_data['delta_run_expectancy'] - \
-        train_data['pred_benchmark']
+    df_with_pitch_values['dre_above_average'] = df_with_pitch_values['delta_run_expectancy'] - \
+        df_with_pitch_values['pred_benchmark']
     
-    train_data['pred_dre_above_average'] = \
-        train_data['pred_delta_run_expectancy'] - \
-        train_data['pred_benchmark']
+    df_with_pitch_values['pred_dre_above_average'] = df_with_pitch_values['pred_delta_run_expectancy'] - \
+        df_with_pitch_values['pred_benchmark']
     
-    train_data['pred_dre_above_average_stuff'] = \
-        train_data['pred_delta_run_expectancy_stuff'] - \
-        train_data['pred_benchmark']
+    df_with_pitch_values['pred_dre_above_average_stuff'] = \
+        df_with_pitch_values['pred_delta_run_expectancy_stuff'] - \
+        df_with_pitch_values['pred_benchmark']
     
-    train_data['pred_dre_above_average_cmd'] = \
-        train_data['pred_delta_run_expectancy_cmd'] - \
-        train_data['pred_benchmark']
+    df_with_pitch_values['pred_dre_above_average_cmd'] = df_with_pitch_values['pred_delta_run_expectancy_cmd'] - \
+        df_with_pitch_values['pred_benchmark']
     
-    train_data['strike_value'] = np.where(train_data.strike_value.isna(),
-                                          -.26-train_data.count_value_away_from_average,
-                                          train_data.strike_value)
+    df_with_pitch_values['strike_value'] = np.where(df_with_pitch_values.strike_value.isna(),
+                                          -.26-df_with_pitch_values.count_value_away_from_average,
+                                          df_with_pitch_values.strike_value)
     
-    train_data['whiff'] = train_data.description.str.contains('swinging_strike')
-    train_data['ground_ball'] = np.where(
-        train_data.launch_angle.isna(), np.nan,
-        train_data.bb_type=='ground_ball')
+    df_with_pitch_values['whiff'] = df_with_pitch_values.description.str.contains('swinging_strike')
+    df_with_pitch_values['ground_ball'] = np.where(
+        df_with_pitch_values.launch_angle.isna(), np.nan,
+        df_with_pitch_values.bb_type=='ground_ball')
     
-    train_data['barrel'] = np.where(
-        train_data.launch_angle.isna(), np.nan,
-            train_data.launch_speed_angle==6)
+    df_with_pitch_values['barrel'] = np.where(
+        df_with_pitch_values.launch_angle.isna(), np.nan,
+            df_with_pitch_values.launch_speed_angle==6)
 
-    train_data['called_strike'] = train_data.description=='called_strike'
+    df_with_pitch_values['called_strike'] = df_with_pitch_values.description=='called_strike'
 
 
-    train_data.to_parquet('train_data.parquet')
+    df_with_pitch_values.to_parquet('data_with_pitch_values.parquet')
     
  
