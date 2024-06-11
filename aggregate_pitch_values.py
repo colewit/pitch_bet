@@ -1,21 +1,19 @@
 
-from engineer_features import predict_xgboost
-import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 
 
-def get_RA_df(all_pitches_df, agg=False):
+def get_RA_df(data_with_pitch_values, agg=False):
     
-    all_pitches_df['post_batting_score'] = np.where(all_pitches_df.inning_topbot=='Bot', 
-                                                    all_pitches_df.post_home_score,
-                                                     all_pitches_df.post_away_score)
+    data_with_pitch_values['post_batting_score'] = np.where(data_with_pitch_values.inning_topbot=='Bot', 
+                                                    data_with_pitch_values.post_home_score,
+                                                     data_with_pitch_values.post_away_score)
     
-    all_pitches_df['batting_score'] = np.where(all_pitches_df.inning_topbot=='Bot', 
-                                               all_pitches_df.home_score,
-                                               all_pitches_df.away_score)
+    data_with_pitch_values['batting_score'] = np.where(data_with_pitch_values.inning_topbot=='Bot', 
+                                               data_with_pitch_values.home_score,
+                                               data_with_pitch_values.away_score)
     
-    RA_df = all_pitches_df[all_pitches_df.end_of_at_bat].groupby(['pitcher', 'game_date'])\
+    RA_df = data_with_pitch_values[data_with_pitch_values.end_of_at_bat].groupby(['pitcher', 'game_date'])\
         .agg({'post_batting_score':'max', 'batting_score':'min', 'out':'sum',
              'inning':'min'}).reset_index()
     
@@ -39,117 +37,64 @@ def get_RA_df(all_pitches_df, agg=False):
     return RA_df
 
 
+def future_rolling_mean(df, columns_to_roll, group_columns, sort_columns,
+                        columns_to_keep, window, min_periods=1, suffix='', drop_duplicates=True):
 
-def build_rolling_df(df, 
-                     roll_columns,
-                     sort_columns, 
-                     group_columns,
-                     merge_columns, 
-                     columns_to_keep,
-                     window_size,
-                     min_period,
-                     roll_index = 'game_date',
-                     drop_duplicates = True,
-                     ascending=True,
-                     suffix = ""):
+    df = df.sort_values(sort_columns)
+    '''
+    df[[x+suffix for x in columns_to_roll]] = df.iloc[::-1].groupby(group_columns, sort=False)[columns_to_roll]\
+            .rolling(window, min_periods=min_periods)\
+            .mean()\
+            .iloc[::-1].reset_index(drop=True)
+
+    '''
+    df[[x+suffix for x in columns_to_roll]] = df.groupby(group_columns, sort=False)[columns_to_roll].transform(
+        lambda x: x.iloc[::-1].rolling(window=window, min_periods=min_periods).mean().iloc[::-1])
     
-    df = df.sort_values(sort_columns, ascending = ascending)
-
-    def roll(df, meta_columns):
-
-        df_tmp = df[roll_columns].rolling(window=window_size, min_periods = min_period).mean()
-        if 'game_date' in df.columns:
-            df_tmp['game_date'] = df.game_date
-
-        for x in meta_columns:
-            df_tmp[x] = df[x]
-
-        return df_tmp
-
-    # Group by pitcher and calculate rolling mean for specified columns
-
-    meta = [ x for x in ['game_date', 'pitcher_at_bat_number', 'player_name'] if x not in group_columns]
-    rolled_data = df \
-        .groupby(group_columns, sort=False)[roll_columns+meta]\
-        .apply(roll, meta_columns = meta).reset_index()
+    rolled_columns = [x+suffix for x in columns_to_roll]
     
+    if not isinstance(group_columns, list):
+        group_columns = [group_columns]
+    
+    df[rolled_columns] = df[rolled_columns + group_columns ].groupby(group_columns).shift(-1)
+    
+    col_subset = group_columns + sort_columns + columns_to_keep
 
-    rename_keys = {x:x+suffix for x in roll_columns}
+    print('subset', col_subset)
+    print(df, 'before')
 
-    rolled_data = rolled_data.rename(columns=rename_keys)
-    rolled_data = rolled_data.groupby(merge_columns).agg('last').reset_index()
-
-    rolled_data = df[merge_columns]\
-        .merge(
-               rolled_data[list(rename_keys.values()) + merge_columns],
-        how = 'left', on = merge_columns)
-
-    col_subset = list(set(merge_columns + columns_to_keep + sort_columns))
-
-    by_cols = [x for x in merge_columns if x != roll_index]
-
-    rolled_data = rolled_data.sort_values(roll_index)
-    df = df.sort_values(roll_index)
-
+    print(rolled_columns, 'are rolled')
     if drop_duplicates:
-        df = df[col_subset].drop_duplicates()
-    else:
-        df = df[col_subset]
-
-    # if it is not a time column make sure they are both floats
-    if not pd.api.types.is_datetime64_any_dtype(df[roll_index]):
-        rolled_data[roll_index] = rolled_data[roll_index].astype(float)
-        df[roll_index] = df[roll_index].astype(float)
-
+        df = df.drop_duplicates(col_subset)
     
+    return df[col_subset+rolled_columns]
     
-    rolled_data = pd.merge_asof(df,
-                              rolled_data.dropna(subset=roll_index), 
-                              by=by_cols, on=roll_index, direction='backward')
+def past_rolling_mean(df, columns_to_roll, group_columns, sort_columns,
+                      columns_to_keep, window, min_periods=1, suffix='', drop_duplicates=True):
 
-    # move roll columns back by one roll index so that it is the rolled column up to
-    # but not including the current roll index. For example if ERA rolled on game date,
-    # then you want rolling era up to but not including the game we are evaluating
-
-    rolled_data[list(rename_keys.values())] = \
-            rolled_data.groupby(group_columns)[list(rename_keys.values())].shift(1)
-
-    return rolled_data
+    df = df.sort_values(sort_columns)
     
-def plot_pdp(xg_model, df, name, date, pred_columns, categorical_columns,
-             cols_to_check_against, pitch_type=None):
+    if not isinstance(group_columns, list):
+        group_columns = [group_columns]
+    '''
+    df[[x+suffix for x in columns_to_roll]] = df.groupby(group_columns, sort=False)[columns_to_roll]\
+            .rolling(window, min_periods=min_periods)\
+            .mean().reset_index(drop=True)
+    '''
+    
+    df[[x+suffix for x in columns_to_roll]] = df.groupby(group_columns, sort=False)[columns_to_roll].transform(
+        lambda x: x.rolling(window=window, min_periods=min_periods).mean())
 
-
-
-    if pitch_type is not None:
-        df=df[df.pitch_type==pitch_type]
-
-    dfp = df[np.logical_and(df.player_name==name,
-                                   df.game_date<=date)].sample(1)
-
-    df = df[df.p_throws == dfp.p_throws.iloc[-1]]
-    batter_d = {}
-    for x in cols_to_check_against:
-        batter_d[x] = np.nanpercentile(df[x], range(5,105,10))
-
-    rep_batter = pd.DataFrame(batter_d)
-
-    dfp = pd.concat([dfp]*len(rep_batter))
-
-    for col in cols_to_check_against:
-        df_cp=dfp.copy(deep=True)
-
-        df_cp[col] = rep_batter[col].values
-
+    rolled_columns = [x+suffix for x in columns_to_roll]
         
-        preds = predict_xgboost(model, 
-                                df_cp, 
-                                pred_columns,
-                                categorical_columns)
+    df[rolled_columns] = df[rolled_columns + group_columns ].groupby(group_columns).shift(1)
+
+    col_subset = group_columns + sort_columns + columns_to_keep
+    if drop_duplicates:
+        df = df.drop_duplicates(col_subset)
+
     
-        print('Showing PDP for column', col)
-        plt.plot(df_cp[col], preds.reshape(-1))
-        plt.show()
+    return df[col_subset+rolled_columns]
 
 def convert_columns_to_RA9_scale(pitcher_df, 
                                 RA_df, 
@@ -208,7 +153,7 @@ def convert_columns_to_RA9_scale(pitcher_df,
             
     return pitcher_df.reset_index()
 
-def clean_and_convert_to_RA9(value_df, all_pitches_df,
+def clean_and_convert_to_RA9(value_df, data_with_pitch_values,
                              sorting_columns, pivot_column, pivot_alias,
                              regress_to_mean = False, suffix=''):
     
@@ -221,7 +166,7 @@ def clean_and_convert_to_RA9(value_df, all_pitches_df,
     value_df = value_df.rename(columns = rename_dict) 
     
     agg_RA = pivot_column is None
-    RA_df = get_RA_df(all_pitches_df, agg=agg_RA)
+    RA_df = get_RA_df(data_with_pitch_values, agg=agg_RA)
 
     pitcher_data = convert_columns_to_RA9_scale(value_df,
                                                 RA_df,
@@ -248,8 +193,6 @@ def clean_and_convert_to_RA9(value_df, all_pitches_df,
         [x for x in pitcher_data.columns if '_RA9' in x]
     
     cols += [x for x in pitcher_data.columns if x not in cols]
-    
-    
     return pitcher_data[cols]
 
 def get_innings_df(inning_df):
@@ -285,7 +228,7 @@ def get_innings_df(inning_df):
 # Rest of your code using inning_df = g(inning_df.copy())
 
 
-if __name__ == '__main__':
+def aggregate_pitch_values(data_with_pitch_values):
 
     def fill_with_first_non_na(series):
         try:
@@ -294,42 +237,37 @@ if __name__ == '__main__':
         except:
             return series
     
-    all_pitches_df = pd.read_parquet('data_with_pitch_values.parquet')
-    all_pitches_df['player_name'] = \
-        all_pitches_df.groupby('pitcher')['player_name']\
+    data_with_pitch_values['player_name'] = \
+        data_with_pitch_values.groupby('pitcher')['player_name']\
         .transform(fill_with_first_non_na)
 
-    all_pitches_df.strikeout = np.where(all_pitches_df.end_of_at_bat, all_pitches_df.strikeout, np.nan)
-    all_pitches_df.walk = np.where(all_pitches_df.end_of_at_bat, all_pitches_df.walk, np.nan)
-    all_pitches_df.homerun = np.where(all_pitches_df.end_of_at_bat, all_pitches_df.homerun, np.nan)
+    data_with_pitch_values.strikeout = np.where(data_with_pitch_values.end_of_at_bat, data_with_pitch_values.strikeout, np.nan)
+    data_with_pitch_values.walk = np.where(data_with_pitch_values.end_of_at_bat, data_with_pitch_values.walk, np.nan)
+    data_with_pitch_values.homerun = np.where(data_with_pitch_values.end_of_at_bat, data_with_pitch_values.homerun, np.nan)
 
-    all_pitches_df['k_pitch_type_adj'] = all_pitches_df['k_pitch_type_adj'].astype(str)
-    all_pitches_df['pitch_type'] = all_pitches_df['pitch_type'].astype(str)
-    all_pitches_df['season'] = all_pitches_df.game_date.dt.year
-    all_pitches_df = all_pitches_df.sort_values('game_date')
+    data_with_pitch_values['k_pitch_type_adj'] = data_with_pitch_values['k_pitch_type_adj'].astype(str)
+    data_with_pitch_values['pitch_type'] = data_with_pitch_values['pitch_type'].astype(str)
+    data_with_pitch_values['season'] = data_with_pitch_values.game_date.dt.year
+    data_with_pitch_values = data_with_pitch_values.sort_values('game_date')
 
     pitch_usage_cols = []
-    for pt in all_pitches_df.k_pitch_type_adj.unique():
-        all_pitches_df[f'is_{pt}'] = (all_pitches_df.k_pitch_type_adj==pt).astype(int)
+    for pt in data_with_pitch_values.k_pitch_type_adj.unique():
+        data_with_pitch_values[f'is_{pt}'] = (data_with_pitch_values.k_pitch_type_adj==pt).astype(int)
         pitch_usage_cols.append(f'is_{pt}')
 
-    all_pitches_df['dummy'] = 1
+    data_with_pitch_values['dummy'] = 1
     
-    all_pitches_df['pitches_this_season'] = all_pitches_df.groupby(['pitcher','season']).dummy.transform('cumsum')
-    all_pitches_df['pitches_this_season_pitch_type'] = all_pitches_df\
+    data_with_pitch_values['pitches_this_season'] = data_with_pitch_values.groupby(['pitcher','season']).dummy.transform('cumsum')
+    data_with_pitch_values['pitches_this_season_pitch_type'] = data_with_pitch_values\
         .groupby(['pitcher','season', 'k_pitch_type_adj']).dummy.transform('cumsum')
 
 
-    all_pitches_df = all_pitches_df.sort_values(['pitcher','game_date','at_bat_number','pitch_number'])
-    all_pitches_df['at_bat_change'] = \
-        (all_pitches_df.groupby(['pitcher','game_date']).at_bat_number.diff().fillna(0)!=0)
+    data_with_pitch_values = data_with_pitch_values.sort_values(['pitcher','game_date','at_bat_number','pitch_number'])
+    data_with_pitch_values['at_bat_change'] = \
+        (data_with_pitch_values.groupby(['pitcher','game_date']).at_bat_number.diff().fillna(0)!=0)
     
-    all_pitches_df['pitcher_at_bat_number'] = all_pitches_df\
+    data_with_pitch_values['pitcher_at_bat_number'] = data_with_pitch_values\
         .groupby(['pitcher','game_date']).at_bat_change.transform('cumsum') + 1
-
-    print(all_pitches_df[np.logical_and(
-        all_pitches_df.player_name=='Iglesias, Raisel', all_pitches_df.end_of_at_bat)].shape, 'is shape')
-
 
     '''
     first are rate stats for outcomes of a pitcher's at bats over their last 600 batters faced
@@ -337,24 +275,18 @@ if __name__ == '__main__':
     
     roll_columns = ['homerun', 'walk', 'strikeout', 'estimated_woba_using_speedangle']
     
-    sort_columns = ['game_date','pitcher','pitcher_at_bat_number']
+    sort_columns = ['game_date','pitcher_at_bat_number']
     group_columns = ['pitcher']
-    merge_columns = ['game_date','pitcher']
     columns_to_keep = ['player_name']
     window_size = 600  # Number of batters faced
     min_period = 50
-    roll_index = 'game_date'
-    outcomes_pitcher_agg = build_rolling_df(all_pitches_df[all_pitches_df.end_of_at_bat], 
-                                            roll_columns,
-                                            sort_columns,
-                                            group_columns,
-                                            merge_columns,
-                                            window_size=window_size,
-                                            min_period=min_period,
-                                            roll_index = roll_index,
-                                            columns_to_keep=columns_to_keep,
-                                            suffix = '_pitcher')
 
+    print('before it is', data_with_pitch_values[data_with_pitch_values.end_of_at_bat][roll_columns])
+    outcomes_pitcher_agg = past_rolling_mean(data_with_pitch_values[data_with_pitch_values.end_of_at_bat],
+                      roll_columns, group_columns, sort_columns,
+                      columns_to_keep, window=window_size, min_periods=min_period, suffix='_pitcher')
+
+    print(outcomes_pitcher_agg.dropna(subset='strikeout_pitcher'), 'is outcome df')
     # get performance over the last 600 at bats up tto day before game. We will get one
     # row per at bat in the previous set up so we keep only the most recent at bat
     outcomes_pitcher_agg = outcomes_pitcher_agg.groupby(['pitcher','game_date']).last().reset_index()
@@ -364,37 +296,6 @@ if __name__ == '__main__':
     at the end of an AB above
     '''
     
-    roll_columns = ['dre_above_average', 'pred_dre_above_average',
-                    'pred_dre_above_average_cmd','pred_dre_above_average_stuff',
-                    'delta_run_expectancy','pred_delta_run_expectancy',
-                    'pred_delta_run_expectancy_cmd','pred_delta_run_expectancy_stuff',
-                    'pred_benchmark']
-    
-    sort_columns = ['game_date','pitcher', 'pitcher_at_bat_number']
-    group_columns = ['pitcher', 'game_date']
-    merge_columns = ['game_date','pitcher','pitcher_at_bat_number']
-    columns_to_keep = ['player_name', 'batter']
-    window_size = 9  # Number of pitches thrown
-    min_period = 3
-    roll_index = 'pitcher_at_bat_number'
-    
-    
-    
-    at_bat_outcomes_df = all_pitches_df\
-        .groupby(['game_date','pitcher','player_name','batter','pitcher_at_bat_number'])\
-        .agg({x:'mean' for x in roll_columns}).reset_index()
-    
-    rolling_value_last_time_thru_order = build_rolling_df(at_bat_outcomes_df,
-                                                          roll_columns,
-                                                          sort_columns,
-                                                          group_columns,
-                                                          merge_columns,
-                                                          window_size=window_size,
-                                                          columns_to_keep=columns_to_keep,
-                                                          min_period=min_period,
-                                                          roll_index = 'pitcher_at_bat_number',
-                                                          suffix = '_last_9_batters')
-    
 
     # what i want to add here is rolling forward performance on all days up until today
     # on pred / empirical pitch value of hitters n thru n+ 3 or 9 batters
@@ -403,23 +304,36 @@ if __name__ == '__main__':
     # but do next 9 batters and then aggregate it sorted by game_date
     # by cummean with ['pitcher_at_bat_number']. Then shift back one
 
+
+    
+    roll_columns = ['dre_above_average', 'pred_dre_above_average',
+                    'pred_dre_above_average_cmd','pred_dre_above_average_stuff',
+                    'delta_run_expectancy','pred_delta_run_expectancy',
+                    'pred_delta_run_expectancy_cmd','pred_delta_run_expectancy_stuff',
+                    'pred_benchmark']
+    
+    at_bat_outcomes_df = data_with_pitch_values\
+        .groupby(['game_date','pitcher','player_name','batter','pitcher_at_bat_number'])\
+        .agg({x:'mean' for x in roll_columns}).reset_index()
+
     window_size = 3
     min_periods = 1
     suffix = '_next_3_batters'
-    rolling_value_next_time_thru_order = build_rolling_df(at_bat_outcomes_df, 
-                                                          roll_columns,
-                                                          sort_columns, 
-                                                          group_columns, 
-                                                          merge_columns,
-                                                          window_size=window_size,
-                                                          columns_to_keep=columns_to_keep,
-                                                          min_period=min_period,
-                                                          ascending = False,
-                                                          roll_index = 'pitcher_at_bat_number',
-                                                          suffix = suffix)
+    group_columns = ['pitcher', 'game_date']
+    sort_columns = ['pitcher_at_bat_number']
+    columns_to_keep=['player_name']
+    rolling_value_next_time_thru_order = \
+        future_rolling_mean(at_bat_outcomes_df, columns_to_roll = roll_columns, 
+                            group_columns = group_columns, 
+                            sort_columns = sort_columns,
+                            columns_to_keep = columns_to_keep,
+                            window = window_size, min_periods=1, suffix = suffix)
+    
 
     # sort by game date
     roll_columns = [x+suffix for x in roll_columns]
+
+    # now make sure we change it to next 3 batters on average over prior games
     rolling_value_next_time_thru_order = rolling_value_next_time_thru_order.sort_values('game_date')
 
     # find cumulative mean of next_3_batters columns up to current date
@@ -440,30 +354,20 @@ if __name__ == '__main__':
                     'pred_delta_run_expectancy_cmd','pred_delta_run_expectancy_stuff',
                     'pred_benchmark', 'called_strike', 'whiff'] + pitch_usage_cols
     
-    sort_columns = ['game_date','pitcher', 'pitcher_at_bat_number']
+    sort_columns = ['game_date', 'pitcher_at_bat_number']
     group_columns = ['pitcher']
-    merge_columns = ['game_date','pitcher']
-    columns_to_keep = ['player_name', 'pitches_this_season', 'pitcher_at_bat_number']
+    columns_to_keep = ['player_name', 'pitches_this_season']
     window_size = 3000  # Number of pitches thrown
     min_period = 500
-    
-    rolling_value_per_pitch = build_rolling_df(all_pitches_df,
-                                               roll_columns,
-                                               sort_columns, 
-                                               group_columns, 
-                                               merge_columns,
-                                               window_size=window_size,
-                                               columns_to_keep=columns_to_keep,
-                                               min_period=min_period,
-                                               suffix = '')
 
-    print(rolling_value_per_pitch[pitch_usage_cols])
+    rolling_value_per_pitch = past_rolling_mean(data_with_pitch_values,
+                      roll_columns, group_columns, sort_columns,
+                      columns_to_keep, window=window_size, min_periods=min_period, suffix='')
+
     
     rolling_value_per_pitch = rolling_value_per_pitch.rename(
         columns = {'called_strike':'called_strike_pitcher',
                    'whiff':'whiff_pitcher'})
-
-
     
     '''
     
@@ -475,28 +379,20 @@ if __name__ == '__main__':
                     'dre_above_average', 'pred_dre_above_average',
                     'pred_dre_above_average_cmd','pred_dre_above_average_stuff']
     
-    sort_columns = ['game_date','pitcher', 'pitcher_at_bat_number']
+    sort_columns = ['game_date','pitcher_at_bat_number']
     group_columns = ['pitcher', 'k_pitch_type_adj']
-    merge_columns = ['game_date','pitcher', 'k_pitch_type_adj']
     columns_to_keep = ['player_name', 'pitch_type', 'pitches_this_season_pitch_type']
     window_size = 1000  # Number of pitches thrown
-    min_period = 200
+    min_period = 100
     
-    pitch_df = all_pitches_df.copy(deep=True)
+    pitch_df = data_with_pitch_values.copy(deep=True)
     pitch_df['homerun'] = pitch_df.homerun.fillna(0)
     pitch_df = pitch_df[pitch_df.k_pitch_type_adj!='nan']
-    
-    rolling_value_by_pitch_type = build_rolling_df(pitch_df, 
-                                       roll_columns,
-                                       sort_columns, 
-                                       group_columns=group_columns, 
-                                       merge_columns=merge_columns,
-                                       window_size = window_size,
-                                       min_period=min_period,
-                                       columns_to_keep=columns_to_keep,
-                                       suffix = '')\
-        .drop_duplicates(['game_date','k_pitch_type_adj','pitcher'])
 
+    rolling_value_by_pitch_type = past_rolling_mean(pitch_df,
+                      roll_columns, group_columns, sort_columns,
+                      columns_to_keep, window=window_size, min_periods=min_period, suffix='')\
+        .drop_duplicates(['game_date','k_pitch_type_adj','pitcher'])
 
     
     value_by_pitch_type_pivot = rolling_value_by_pitch_type.pivot_table(
@@ -509,11 +405,11 @@ if __name__ == '__main__':
     
     value_by_pitch_type_pivot.columns = ['_'.join(x).strip('_') for x in value_by_pitch_type_pivot.columns]
 
-    inning_df = all_pitches_df[all_pitches_df.end_of_at_bat].copy(deep=True)
+    inning_df = data_with_pitch_values[data_with_pitch_values.end_of_at_bat].copy(deep=True)
 
     inning_df = get_innings_df(inning_df)
     
-    pitch_use_df = all_pitches_df[['pitcher','k_pitch_type_adj','game_date', 'at_bat_number']].copy(deep=True)
+    pitch_use_df = data_with_pitch_values[['pitcher','k_pitch_type_adj','game_date', 'at_bat_number']].copy(deep=True)
     pitch_use_df = pitch_use_df.sort_values(['game_date','at_bat_number'])
     
     pitch_use_df['dummy'] = 1
@@ -530,15 +426,8 @@ if __name__ == '__main__':
                how = 'left', on =['game_date', 'pitcher'])
     
     
-    rolling_value_last_time_thru_order = clean_and_convert_to_RA9(rolling_value_last_time_thru_order,
-                          all_pitches_df,
-                          suffix='_last_9_batters',
-                          pivot_column=None,
-                          pivot_alias=None,
-                          sorting_columns = ['pitcher','game_date', 'pitcher_at_bat_number'])
-
     rolling_value_next_time_thru_order = clean_and_convert_to_RA9(rolling_value_next_time_thru_order,
-                          all_pitches_df,
+                          data_with_pitch_values,
                           suffix='_next_3_batters',
                           pivot_column=None,
                           pivot_alias=None,
@@ -546,7 +435,7 @@ if __name__ == '__main__':
 
 
     regressed_pitcher_data = clean_and_convert_to_RA9(pitcher_value_over_past_season,
-                          all_pitches_df,
+                          data_with_pitch_values,
                           suffix='',
                           pivot_column=None,
                           pivot_alias=None,
@@ -554,27 +443,22 @@ if __name__ == '__main__':
                           sorting_columns = ['pitcher','game_date', 'pitcher_at_bat_number'])
 
     rolling_value_by_pitch_type = clean_and_convert_to_RA9(rolling_value_by_pitch_type,
-                            all_pitches_df,
+                            data_with_pitch_values,
                             pivot_column='k_pitch_type_adj',
                             pivot_alias='pitch_type',
                             sorting_columns = ['pitcher','game_date', 'pitcher_at_bat_number'])
 
-    all_rolling_pitch_data = rolling_value_last_time_thru_order \
-        .merge(rolling_value_by_pitch_type[['game_date','pitcher'] + \
-               [x for x in rolling_value_by_pitch_type.columns if '_RA9' in x]],
-               how = 'left', on = ['game_date','pitcher'])
-
-    
-    all_rolling_pitch_data = all_rolling_pitch_data \
-        .merge(regressed_pitcher_data[['game_date','pitcher'] + \
+    all_rolling_pitch_data  = \
+        rolling_value_next_time_thru_order.merge(regressed_pitcher_data[['game_date','pitcher'] + \
                [x for x in regressed_pitcher_data.columns
+                if x not in rolling_value_next_time_thru_order.columns]],
+               how = 'left', on = ['game_date','pitcher'])
+    
+    all_rolling_pitch_data = all_rolling_pitch_data  \
+        .merge(rolling_value_by_pitch_type [['game_date','pitcher'] + \
+               [x for x in rolling_value_by_pitch_type.columns
                 if x not in all_rolling_pitch_data.columns]],
                how = 'left', on = ['game_date','pitcher'])
-
-    all_rolling_pitch_data = all_rolling_pitch_data \
-        .merge(rolling_value_next_time_thru_order[['game_date','pitcher','pitcher_at_bat_number'] + \
-               [x for x in rolling_value_next_time_thru_order.columns if '_RA9' in x]],
-               how = 'left', on = ['game_date','pitcher','pitcher_at_bat_number'])
 
     all_rolling_pitch_data = all_rolling_pitch_data.merge(value_by_pitch_type_pivot[
         [x for x in value_by_pitch_type_pivot.columns 
@@ -585,7 +469,10 @@ if __name__ == '__main__':
         [x for x in outcomes_pitcher_agg.columns 
          if x not in all_rolling_pitch_data.columns] + ['pitcher','game_date']], 
         how='left', on = ['pitcher','game_date'])
-
     
-    all_rolling_pitch_data.to_parquet('rolling_pitch_value.parquet')
+    return all_rolling_pitch_data
 
+if __name__ == '__main__':
+    
+    data_with_pitch_values = pd.read_parquet('data_with_pitch_values.parquet')
+    all_rolling_pitch_data = aggregate_pitch_values(data_with_pitch_values)
