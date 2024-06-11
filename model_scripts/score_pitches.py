@@ -122,11 +122,13 @@ def predict_xgboost(xg_model, data, pred_columns, categorical_columns, proba=Fal
 def train_pitch_value_models(df, path):
 
     df['pitch_type'] = df.pitch_type.astype('category')
+
+    categorical_columns = ["zone", "pitch_type"]
     called_data = df[
         np.logical_and(df.taken, df.game_date<ball_strike_model_train_cutoff)]\
-        .dropna(subset=xgboost_ball_strike_pred_columns)
-
-    ball_strike_model = train_xgboost(called_data, 'strike', xgboost_ball_strike_pred_columns, ["zone", "pitch_type"])
+        .dropna(subset=xgboost_ball_strike_pred_columns + categorical_columns)
+    
+    ball_strike_model = train_xgboost(called_data, 'strike', xgboost_ball_strike_pred_columns, categorical_columns)
     
     with open(f'{path}/model_ball_strike.pkl','wb') as f:
         pickle.dump(ball_strike_model, f)
@@ -134,7 +136,7 @@ def train_pitch_value_models(df, path):
     df['pitch_type'] = df.pitch_type.astype(str)
 
     df['strike_probability'] = predict_xgboost(ball_strike_model, df, xgboost_ball_strike_pred_columns, 
-                                               categorical_columns=["zone", "pitch_type"], proba=True)
+                                               categorical_columns=categorical_columns, proba=True)
         
         
     df['pitch_type'] = df.pitch_type.astype(str)

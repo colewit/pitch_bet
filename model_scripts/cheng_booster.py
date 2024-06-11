@@ -10,7 +10,7 @@ import sys
 import psutil
 
 import traceback
-from ordinal_losses import create_corn_obj_xgb, create_corn_eval_xgb
+from model_scripts.ordinal_losses import create_corn_obj_xgb, create_corn_eval_xgb
 
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.metrics import mean_absolute_error, accuracy_score, make_scorer

@@ -9,7 +9,7 @@ import gc
 import sys
 import psutil
 
-from ordinal_losses import CornLoss
+from model_scripts.ordinal_losses import CornLoss
 from spacecutter.models import OrdinalLogisticModel
 from spacecutter.losses import CumulativeLinkLoss
 from spacecutter.callbacks import AscensionCallback
