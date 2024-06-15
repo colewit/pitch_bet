@@ -1,7 +1,6 @@
 
 import pickle
-
-
+import os
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
@@ -10,8 +9,7 @@ from sklearn.decomposition import PCA
 
 from sklearn.model_selection import GridSearchCV
 from sklearn.model_selection import ParameterGrid
-
-
+from sklearn.pipeline import Pipeline
 
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
@@ -194,11 +192,6 @@ def pitcher_specific_metrics(df):
     return df
 
 
-
-
-
-
-
 def divide_rectangle(x1, y1, x2, y2, n_rect = 9):
     # Calculate width and height of the rectangle
     width = x2 - x1
@@ -317,80 +310,85 @@ def find_sz_edges(df, edge_tolerance = 2/12):
     return df
 
 
-
-
-
-def find_k_pitch_types(df, n_clusters=6, use_pca=True, n_components=4):
-
-
-    pitch_group_columns = ['velo_percentile_for_pitcher','release_spin_rate',
-                           'armside_horz_break','pfx_z', 'armside_tilt', 'spin_efficiency']
+def fit_pipeline_for_k_pitch_types(df, n_clusters=6, use_pca=True, n_components=4):
+    
+    pitch_group_columns = ['velo_percentile_for_pitcher', 'release_spin_rate',
+                           'armside_horz_break', 'pfx_z', 'armside_tilt', 'spin_efficiency']
     pitch_types = df[pitch_group_columns].dropna()
-    
-    # Run K-Means clustering
+
+    # Define the scaler and KMeans
+    scaler = StandardScaler()
     kmeans = KMeans(n_clusters=n_clusters, random_state=42)
-    
+
     if use_pca:
-        # Standardize the features (important for PCA)
-        scaler = StandardScaler()
-        scaled_data = scaler.fit_transform(pitch_types)
-        
-        # Initialize PCA with the number of components you want to retain
+        # Define the PCA
         pca = PCA(n_components=n_components)
         
-        # Perform PCA
-        pca.fit(scaled_data)
-
-        # Transform the data into the new feature space
-        pca_data = pca.transform(scaled_data)
+        # Create a pipeline with StandardScaler, PCA, and KMeans
+        pipeline = Pipeline([
+            ('scaler', scaler),
+            ('pca', pca),
+            ('kmeans', kmeans)
+        ])
+        
+        # Fit the pipeline to the data
+        pipeline.fit(pitch_types)
         
         # Optionally, you can examine the explained variance ratio
-        explained_variance_ratio = pca.explained_variance_ratio_
+        explained_variance_ratio = pipeline.named_steps['pca'].explained_variance_ratio_
         print("Explained Variance Ratio:", explained_variance_ratio)
-
-        kmeans.fit(pca_data)
-    
+        
     else:
-        kmeans.fit(scaled_data)
+        # Create a pipeline with only the StandardScaler and KMeans
+        pipeline = Pipeline([
+            ('scaler', scaler),
+            ('kmeans', kmeans)
+        ])
+        
+        # Fit the pipeline to the data
+        pipeline.fit(pitch_types)
+
+    return pipeline
+
+def predict_k_pitch_types(df, pipeline, k_pitch_type_map=None):
+    
+    # Predict cluster labels
+    pitch_group_columns = ['velo_percentile_for_pitcher', 'release_spin_rate',
+                           'armside_horz_break', 'pfx_z', 'armside_tilt', 'spin_efficiency']
+    df['est_pitch_type'] = pipeline.predict(df[pitch_group_columns].fillna(0))
 
     # Print cluster labels
-    print("Cluster labels:", kmeans.labels_)
+    print("Cluster labels:", pipeline.named_steps['kmeans'].labels_)
     
-    # (Optional) Print cluster centers after standardization
-    print("Cluster centers (after standardization):")
-    print(kmeans.cluster_centers_)
+    # Print cluster centers after transformation
+    print("Cluster centers (after transformation):")
+    print(pipeline.named_steps['kmeans'].cluster_centers_)
 
-    if use_pca:
-        df['est_pitch_type'] = kmeans.predict(
-            pca.transform(scaler.transform(df[pitch_group_columns].fillna(0))))
-    else:
-        df['est_pitch_type'] = kmeans.predict(
-            scaler.transform(df[pitch_group_columns].fillna(0)))
-
-    # align the models est pitch type with the most frequent label statcast gives those pitches
-    k_pitch_types = df.groupby('est_pitch_type')\
-        .agg(k_pitch_type =('pitch_type',pd.Series.mode)).reset_index()
+    if k_pitch_type_map is None:
+        # Align the model's estimated pitch type with the most frequent label statcast gives those pitches
+        k_pitch_type_map = df.groupby('est_pitch_type').agg(k_pitch_type=('pitch_type', pd.Series.mode)).reset_index()
+        
+        k_pitch_type_map['count'] = k_pitch_type_map.groupby('k_pitch_type')\
+            .est_pitch_type.transform(lambda x: range(1, 1 + len(x)))
+        
+        k_pitch_type_map['total_count'] = k_pitch_type_map.groupby('k_pitch_type')['count'].transform('max')
     
-    k_pitch_types['count'] = k_pitch_types.\
-        groupby('k_pitch_type').est_pitch_type.transform(lambda x:range(1,1+len(x)))
+        # Rename so that if two clusters are FF we get FF_1 and FF_2
+        k_pitch_type_map['k_pitch_type'] = np.where(k_pitch_type_map.total_count > 1, 
+                                                 k_pitch_type_map.k_pitch_type.astype(str) + '_' + \
+                                                 k_pitch_type_map['count'].astype(str),
+                                                 k_pitch_type_map.k_pitch_type.astype(str))
+
+
+
+
     
-    k_pitch_types['total_count'] = k_pitch_types.\
-        groupby('k_pitch_type')['count'].transform('max')
+    df = df.merge(k_pitch_type_map[['k_pitch_type', 'est_pitch_type']],
+                  how='left', on='est_pitch_type').drop(columns='est_pitch_type')
 
-    # rename so that if two clusters are FF we get FF_1 and FF_2
-    k_pitch_types['k_pitch_type'] = np.where(k_pitch_types.total_count>1, 
-                              k_pitch_types.k_pitch_type.astype(str) +'_'+ k_pitch_types['count'].astype(str),
-                              k_pitch_types.k_pitch_type.astype(str))
+    df['k_pitch_type_adj'] = df.groupby(['pitch_type', 'pitcher']).k_pitch_type.transform(lambda x: x.mode().iloc[0])
 
-    df = df.merge(k_pitch_types[['k_pitch_type','est_pitch_type']],
-         how = 'left', on = 'est_pitch_type').drop(columns = 'est_pitch_type')
-
-    df['k_pitch_type_adj'] = df.groupby(['pitch_type', 'pitcher'])\
-        .k_pitch_type.transform(lambda x: x.mode().iloc[0])
-
-    return df
-
-
+    return df, k_pitch_type_map
 
 def get_context_stats(df, at_bat_cap = 400):
     
@@ -482,7 +480,7 @@ def get_context_stats(df, at_bat_cap = 400):
     df['count_value_away_from_average'] = df.count_value - df.count_value.mean()
     return df
 
-def engineer_features(df):
+def engineer_features(df, pitch_type_pipeline_path, fit_pipeline, k_pitch_type_map=None):
         
     df = pitch_physics(df)
     df = find_sz_edges(df, edge_tolerance = 2/12)
@@ -494,8 +492,20 @@ def engineer_features(df):
     
 
     df['taken'] = np.logical_or(df.description == 'called_strike', df.ball)
-    
-    df = find_k_pitch_types(df, n_clusters=6, use_pca=True, n_components=4)
+
+    if fit_pipeline:
+        
+        pipeline = fit_pipeline_for_k_pitch_types(df, n_clusters=6, use_pca=True, n_components=4)
+        if not os.path.isdir(pitch_type_pipeline_path):
+            os.makedirs(pitch_type_pipeline_path)
+            
+        with open(f'{pitch_type_pipeline_path}/model.pkl', 'wb') as f:
+            pickle.dump(pipeline, f)
+    else:
+        with open(f'{pitch_type_pipeline_path}/model.pkl', 'rb') as f:
+            pipeline = pickle.load(f)
+
+    df, k_pitch_type_map = predict_k_pitch_types(df, pipeline, k_pitch_type_map)
     df = get_context_stats(df)
     
     df['delta_run_expectancy'] = np.where(
@@ -505,7 +515,7 @@ def engineer_features(df):
     
     df.stand = np.where(df.stand=='L',1,0)
     df.p_throws = np.where(df.p_throws=='L',1,0)
-    return df
+    return df, k_pitch_type_map
 
 if __name__=='__main__':
 

@@ -76,11 +76,6 @@ def past_rolling_mean(df, columns_to_roll, group_columns, sort_columns,
     
     if not isinstance(group_columns, list):
         group_columns = [group_columns]
-    '''
-    df[[x+suffix for x in columns_to_roll]] = df.groupby(group_columns, sort=False)[columns_to_roll]\
-            .rolling(window, min_periods=min_periods)\
-            .mean().reset_index(drop=True)
-    '''
     
     df[[x+suffix for x in columns_to_roll]] = df.groupby(group_columns, sort=False)[columns_to_roll].transform(
         lambda x: x.rolling(window=window, min_periods=min_periods).mean())
@@ -199,7 +194,7 @@ def get_innings_df(inning_df):
     
     # Sort by game_date and at_bat_number
     inning_df = inning_df.sort_values(['game_date', 'at_bat_number'])
-
+    
     # Define a rolling window function
     def rolling_sum_last_year(df, window='365D'):
         df = df.set_index('game_date').sort_index()
@@ -217,16 +212,14 @@ def get_innings_df(inning_df):
     inning_df = inning_df.groupby(['pitcher', 'game_date']).last().reset_index()
     
     inning_df['innings'] = inning_df['out_cumsum'] / 3
-    inning_df['multiplier'] = 180 / inning_df['innings'].clip(0, 180) - 1
-
+    
+    
     inning_df = inning_df.sort_values('game_date')
     inning_df['innings'] = inning_df.groupby('pitcher').innings.shift(1)
-    inning_df['multiplier'] = inning_df.groupby('multiplier').innings.shift(1)
+    
+    inning_df['multiplier'] = 180 / inning_df['innings'].clip(0, 180) - 1
 
     return inning_df
-
-# Rest of your code using inning_df = g(inning_df.copy())
-
 
 def aggregate_pitch_values(data_with_pitch_values):
 
@@ -241,9 +234,14 @@ def aggregate_pitch_values(data_with_pitch_values):
         data_with_pitch_values.groupby('pitcher')['player_name']\
         .transform(fill_with_first_non_na)
 
-    data_with_pitch_values.strikeout = np.where(data_with_pitch_values.end_of_at_bat, data_with_pitch_values.strikeout, np.nan)
-    data_with_pitch_values.walk = np.where(data_with_pitch_values.end_of_at_bat, data_with_pitch_values.walk, np.nan)
-    data_with_pitch_values.homerun = np.where(data_with_pitch_values.end_of_at_bat, data_with_pitch_values.homerun, np.nan)
+    data_with_pitch_values.strikeout = np.where(data_with_pitch_values.end_of_at_bat,
+                                                data_with_pitch_values.strikeout, np.nan)
+    
+    data_with_pitch_values.walk = np.where(data_with_pitch_values.end_of_at_bat,
+                                           data_with_pitch_values.walk, np.nan)
+    
+    data_with_pitch_values.homerun = np.where(data_with_pitch_values.end_of_at_bat,
+                                              data_with_pitch_values.homerun, np.nan)
 
     data_with_pitch_values['k_pitch_type_adj'] = data_with_pitch_values['k_pitch_type_adj'].astype(str)
     data_with_pitch_values['pitch_type'] = data_with_pitch_values['pitch_type'].astype(str)
@@ -252,12 +250,17 @@ def aggregate_pitch_values(data_with_pitch_values):
 
     pitch_usage_cols = []
     for pt in data_with_pitch_values.k_pitch_type_adj.unique():
+
+        if str(pt) =='nan' or str(pt) == 'None':
+            continue
+            
         data_with_pitch_values[f'is_{pt}'] = (data_with_pitch_values.k_pitch_type_adj==pt).astype(int)
         pitch_usage_cols.append(f'is_{pt}')
 
     data_with_pitch_values['dummy'] = 1
     
-    data_with_pitch_values['pitches_this_season'] = data_with_pitch_values.groupby(['pitcher','season']).dummy.transform('cumsum')
+    data_with_pitch_values['pitches_this_season'] = \
+        data_with_pitch_values.groupby(['pitcher','season']).dummy.transform('cumsum')
     data_with_pitch_values['pitches_this_season_pitch_type'] = data_with_pitch_values\
         .groupby(['pitcher','season', 'k_pitch_type_adj']).dummy.transform('cumsum')
 
@@ -273,18 +276,33 @@ def aggregate_pitch_values(data_with_pitch_values):
     first are rate stats for outcomes of a pitcher's at bats over their last 600 batters faced
     '''
     
-    roll_columns = ['homerun', 'walk', 'strikeout', 'estimated_woba_using_speedangle']
-    
+    roll_columns = ['homerun', 'walk', 'strikeout']
     sort_columns = ['game_date','pitcher_at_bat_number']
     group_columns = ['pitcher']
     columns_to_keep = ['player_name']
     window_size = 600  # Number of batters faced
     min_period = 50
 
-    print('before it is', data_with_pitch_values[data_with_pitch_values.end_of_at_bat][roll_columns])
-    outcomes_pitcher_agg = past_rolling_mean(data_with_pitch_values[data_with_pitch_values.end_of_at_bat],
+    outcomes_pitcher = data_with_pitch_values[data_with_pitch_values.end_of_at_bat]
+
+    outcomes_pitcher_agg1 = past_rolling_mean(outcomes_pitcher,
                       roll_columns, group_columns, sort_columns,
                       columns_to_keep, window=window_size, min_periods=min_period, suffix='_pitcher')
+
+    # want a smaller rolling min period for estimated woba since it requires contact
+    roll_columns = ['estimated_woba_using_speedangle']
+    min_period = 25
+    outcomes_pitcher_agg2 = past_rolling_mean(outcomes_pitcher,
+                      roll_columns, group_columns, sort_columns,
+                      columns_to_keep, window=window_size, min_periods=min_period, suffix='_pitcher')
+
+
+    columns_df2 = ['pitcher_at_bat_number','pitcher','game_date', 'estimated_woba_using_speedangle_pitcher']
+    
+    outcomes_pitcher_agg = \
+        outcomes_pitcher_agg1\
+        .merge(outcomes_pitcher_agg2[columns_df2],
+               how = 'left', on = ['pitcher_at_bat_number','pitcher','game_date'])
 
     print(outcomes_pitcher_agg.dropna(subset='strikeout_pitcher'), 'is outcome df')
     # get performance over the last 600 at bats up tto day before game. We will get one
@@ -375,10 +393,11 @@ def aggregate_pitch_values(data_with_pitch_values):
     '''
     
     roll_columns = ['called_strike', 'whiff',
-                    'homerun','estimated_woba_using_speedangle',
+                    'homerun',
                     'dre_above_average', 'pred_dre_above_average',
                     'pred_dre_above_average_cmd','pred_dre_above_average_stuff']
-    
+
+
     sort_columns = ['game_date','pitcher_at_bat_number']
     group_columns = ['pitcher', 'k_pitch_type_adj']
     columns_to_keep = ['player_name', 'pitch_type', 'pitches_this_season_pitch_type']
@@ -389,9 +408,23 @@ def aggregate_pitch_values(data_with_pitch_values):
     pitch_df['homerun'] = pitch_df.homerun.fillna(0)
     pitch_df = pitch_df[pitch_df.k_pitch_type_adj!='nan']
 
-    rolling_value_by_pitch_type = past_rolling_mean(pitch_df,
+    rolling_value_by_pitch_type1 = past_rolling_mean(pitch_df,
                       roll_columns, group_columns, sort_columns,
-                      columns_to_keep, window=window_size, min_periods=min_period, suffix='')\
+                      columns_to_keep, window=window_size, min_periods=min_period, suffix='')
+
+    # want a smaller rolling min period for estimated woba since it requires contact
+    roll_columns = ['estimated_woba_using_speedangle']
+    min_period = 15
+    rolling_value_by_pitch_type2 = past_rolling_mean(pitch_df,
+                      roll_columns, group_columns, sort_columns,
+                      columns_to_keep, window=window_size, min_periods=min_period, suffix='')
+
+
+    columns_df2 = ['pitcher_at_bat_number','pitcher','game_date', 'estimated_woba_using_speedangle']
+    rolling_value_by_pitch_type = \
+        rolling_value_by_pitch_type1\
+        .merge(rolling_value_by_pitch_type2[columns_df2],
+               how = 'left', on = ['pitcher_at_bat_number','pitcher','game_date'])\
         .drop_duplicates(['game_date','k_pitch_type_adj','pitcher'])
 
     

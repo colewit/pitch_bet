@@ -1,26 +1,29 @@
 import numpy as np
 import pandas as pd
-from assemble_event_model_data import *
-import pickle
-from config import pitch_model_train_cutoff
-import xgboost as xgb
 
-import matplotlib.pyplot as plt
+import copy
 import time
-from ordinal_losses import sigmoid
 import sys
-import numpy as np
-import pandas as pd
-from multiprocessing import Pool, Manager
 import pickle
-import time
 import traceback
 from functools import partial
+
+import matplotlib.pyplot as plt
+import xgboost as xgb
+
+from pitcher_pull_model import prep_data_for_pitcher_pull
+from model_scripts.ordinal_losses import sigmoid
+from data_pipeline.assemble_event_model_data import *
+from config import pitch_model_train_cutoff
+
+pd.set_option('future.no_silent_downcasting', True)
+
+pd.options.display.max_columns = 1000
 
 
 def predict_xgboost(xg_model, data, pred_columns,
                     categorical_columns, one_hot_encoder=None,
-                    proba=False, binary_proba=True, platt_models=None):
+                    proba=False, binary_proba=True):
 
     data = data[pred_columns]
 
@@ -45,9 +48,6 @@ def predict_xgboost(xg_model, data, pred_columns,
         preds = xg_model.predict(dmat)
         if binary_proba:
             preds = preds[:,1]
-
-        if platt_models is not None:
-            preds = platt_scaling(data, preds, platt_models)
     else:
         preds = xg_model.predict(dmat)
     
@@ -56,11 +56,12 @@ def predict_xgboost(xg_model, data, pred_columns,
 
 def predict_xgboost_ordinal(xg_model, data):
 
-    data = data[xg_model.feature_names].astype(float)
+    data = data[xg_model.feature_names].astype(float).values
 
-    dmat = xgb.DMatrix(data)
-    
-    logits = xg_model.predict(dmat, output_margin=True)
+    # faster for this purpose than predict as we dont need to convert to dmatrix
+    # margin assures raw logits
+    logits = xg_model.inplace_predict(data, predict_type='margin')
+
     preds = sigmoid(logits)
     preds = np.cumprod(preds, axis=1)
     
@@ -73,17 +74,10 @@ def predict_xgboost_ordinal(xg_model, data):
         # Probabilities for subsequent classes
         for i in range(1, preds.shape[1]):
             probas[row, i] = preds[row, i - 1] - preds[row, i]
-    # add homer proba
-    probas =np.hstack([probas, 1- probas.sum(axis=1).reshape(-1,1)])
-    
-    return probas
 
-def platt_scaling(data, probas, linear_model):
- 
-    probas = pd.DataFrame(probas, columns = ['strikeout','fieldout','walk','single','double','homerun'])
-    lr_train = pd.concat([data.reset_index(drop=True), probas], axis = 1)
-    
-    linear_model.fit(lr_train, xtrain.label)
+    # adds homer proba
+    probas =np.hstack([probas, 1- probas.sum(axis=1).reshape(-1,1)])
+    return probas
     
 class Game(object):
 
@@ -93,19 +87,13 @@ class Game(object):
         self.reset_state()
         self.pull_pitcher_model = None
 
-    def setup_event_model(self,event_model,pred_columns, 
-                          categorical_columns, one_hot_encoder, platt_models):
+    def setup_event_model(self,event_model):
 
         self.model = event_model
-        self.one_hot_encoder = one_hot_encoder
-        self.pred_columns = pred_columns
-        self.categorical_columns = categorical_columns
-        self.platt_models=platt_models
 
-    def predict_event(self, pitcher_data, platt_models):
+    def predict_event(self, pitcher_data):
 
-        event_probas = predict_xgboost_ordinal(self.model,
-                                       pitcher_data)
+        event_probas = predict_xgboost_ordinal(self.model, pitcher_data)
         return event_probas
         
     def setup_pull_pitcher_model(self,
@@ -128,158 +116,11 @@ class Game(object):
         self.pull_pitcher_model = pull_pitcher_model
         self.pull_pitcher_data = np.zeros((self.n_games, 36, len(self.pull_pitcher_columns)))
     
-    def update_state_for_event_model(self, batter):
 
-        df = pd.DataFrame(self.all_event_dicts)
-        
-
-        df['linear_weight'] = df.walk*.55 + df.single*.7 + \
-            1.0*df.double + 1.26*df.triple + df.homerun*1.65 - .26
-        
-        batter_df = df[df.batter==batter]
-        
-        df['curr_inning'] = df.groupby('game_idx').inning.transform(lambda x : x == x.max())
-        inning_df = df[df.curr_inning]
-      
-        
-        state_data = {}
-
-        state_data['game_idx'] = range(self.n_games)
-        state_data['inning'] = self.inning#[game_idx]
-        state_data['outs_when_up'] = self.outs#[game_idx]
-        state_data['on_1b'] = self.runner_on_1b#[game_idx]
-        state_data['on_2b'] = self.runner_on_2b#[game_idx]
-        state_data['on_3b'] = self.runner_on_3b#[game_idx]
-
-        state_data = pd.DataFrame(state_data)
-        
-        categories = ['strikeout', 'walk', 'single','double', 'homerun',  'linear_weight']
-        if batter is None:
-            for category in categories:
-                state_data[f'{category}s_so_far'] = np.nan
-                state_data[f'{category}s_this_inning'] = np.nan
-    
-            # Calculate rolling sum for each category
-            for category in categories:
-                state_data[f'{category}s_last_3'] = np.nan
-                state_data[f'{category}s_last_9'] = np.nan
-    
-            for category in categories:
-                state_data[f'batter_{category}s_today'] = np.nan
-       
-            state_data['batter_last_ab'] = np.nan  
-            state_data['last_ab'] = np.nan
-
-        # Calculate cumulative sum for each category and each inning
-        else:
-
-            game_state_df = df.groupby('game_idx').agg(
-                strikeouts_so_far = ('strikeout','sum'),
-                batting_score = ('runs','sum'),
-                walks_so_far = ('walk','sum'),
-                singles_so_far = ('single','sum'),
-                doubles_so_far = ('double','sum'),
-                homeruns_so_far = ('homerun','sum'),
-                linear_weights_so_far = ('linear_weight','sum'),
-                last_ab = ('event', 'last')).reset_index()
-
-            last_3_state_df = df.groupby('game_idx').tail(3).reset_index()
-            if last_3_state_df.shape[0] == self.n_games * 3:
-        
-                last_3_state_df = last_3_state_df.groupby('game_idx').agg(
-                    strikeouts_last_3 = ('strikeout','sum'),
-                    walks_last_3 = ('walk','sum'),
-                    singles_last_3 = ('single','sum'),
-                    doubles_last_3 = ('double','sum'),
-                    homeruns_last_3= ('homerun','sum'),
-                    linear_weights_last_3 = ('linear_weight','sum')).reset_index()
-            else:
-                d={}
-                d['game_idx'] = range(self.n_games)
-                for k in categories:
-                    d[k+'_last_3'] = np.nan
-                last_3_state_df = pd.DataFrame(d)
-
-
-            
-            last_9_state_df = df.groupby('game_idx').tail(9).reset_index()
-
-            if last_9_state_df.shape[0] == self.n_games * 9:
-                last_9_state_df = last_9_state_df.groupby('game_idx').agg(
-                    strikeouts_last_9 = ('strikeout','sum'),
-                    walks_last_9 = ('walk','sum'),
-                    singles_last_9 = ('single','sum'),
-                    doubles_last_9 = ('double','sum'),
-                    homeruns_last_9 = ('homerun','sum'),
-                    linear_weights_last_9 = ('linear_weight','sum')).reset_index()
-            else:
-                d={}
-                d['game_idx'] = range(self.n_games)
-                for k in categories:
-                    d[k+'_last_9'] = np.nan
-                last_9_state_df = pd.DataFrame(d)
-                
-            inning_state_df = inning_df.groupby('game_idx').agg(
-                strikeouts_this_inning = ('strikeout','sum'),
-                walks_this_inning = ('walk','sum'),
-                singles_this_inning = ('single','sum'),
-                doubles_this_inning = ('double','sum'),
-                homeruns_this_inning = ('homerun','sum'),
-                linear_weights_this_inning = ('linear_weight','sum')).reset_index()
-                
-
-
-            if batter_df.empty:
- 
-                d={}
-                d['batter_last_ab'] = np.nan
-                d['game_idx'] = range(self.n_games)
-                
-                for k in categories:
-                    d[f'batter_{k}s_today'] = np.nan
-                    
-                batter_df = pd.DataFrame(d)
-                
-            else:
-
-                batter_df = batter_df.groupby('game_idx').agg(
-                    batter_last_ab = ('event', 'last'),
-                    batter_strikeouts_today= ('strikeout','sum'),
-                    batter_walks_today= ('walk','sum'),
-                    batter_singles_today= ('single','sum'),
-                    batter_doubles_today = ('double','sum'),
-                    batter_homeruns_today = ('homerun','sum'),
-                    batter_linear_weights_today= ('linear_weight','sum')).reset_index()
-
-
-            state_data = state_data.merge(batter_df, how = 'left', on='game_idx')
-            state_data = state_data.merge(game_state_df, how = 'left', on='game_idx')
-            state_data = state_data.merge(last_3_state_df, how = 'left', on='game_idx')
-            state_data = state_data.merge(last_9_state_df, how = 'left', on='game_idx')
-            
-        #print("STATE DATA")
-        #display(state_data.head())
-        return state_data
         
     def reset_state(self):
 
-        self.all_event_dicts = {
-            'walk':[],
-            'out':[],
-            'strikeout':[],
-            'single':[],
-            'double':[],
-            'triple':[],
-            'homerun':[],
-            'batter':[],
-            'event':[],
-            'runs':[],
-            'inning':[],
-            'game_idx':[]
-            
-        }
-
-        
+        self.curr_inning_start = np.zeros(self.n_games)
         self.inning=np.ones(self.n_games)
         self.outs = np.zeros(self.n_games)
         self.outs_recorded = np.zeros(self.n_games)
@@ -288,16 +129,22 @@ class Game(object):
         self.runner_on_2b = np.zeros(self.n_games).astype(bool)
         self.runner_on_3b = np.zeros(self.n_games).astype(bool)
         
-        self.runs = np.zeros(self.n_games)
+        
         self.event_runs = np.zeros(self.n_games)
  
         self.state_df = self.update_state_for_event_model(None)
+
+        self.runs_arr = np.zeros((self.n_games, 36)).astype(int)
+        self.events_arr = np.zeros((self.n_games, 36)).astype(int)
+        self.linear_weights_arr = np.zeros((self.n_games, 36))
+
 
     def end_inning(self, end_inning_indices):
         self.runner_on_1b[end_inning_indices] = np.zeros(self.n_games)[end_inning_indices]
         self.runner_on_2b[end_inning_indices] = np.zeros(self.n_games)[end_inning_indices]
         self.runner_on_3b[end_inning_indices] = np.zeros(self.n_games)[end_inning_indices]
         self.outs[end_inning_indices] = np.zeros(self.n_games)[end_inning_indices]
+        self.curr_inning_start[end_inning_indices] = self.batter+1
 
     def record_field_out(self, out_indices):
 
@@ -321,9 +168,7 @@ class Game(object):
         
         self.runner_on_2b[out_indices] = np.logical_and(self.runner_on_2b, 
                                                         ~moves_to_third)[out_indices]
-        
 
-        
         end_inning_indices = np.logical_and(out_indices, self.outs==3)
         self.end_inning(end_inning_indices)
 
@@ -380,7 +225,7 @@ class Game(object):
         self.runner_on_2b[homerun_indices]=0
         self.runner_on_1b[homerun_indices]=0
  
-    def record_walk(self,walk_indices):#game_idx):
+    def record_walk(self,walk_indices):
 
 
         bases_loaded = \
@@ -407,47 +252,72 @@ class Game(object):
             return self.pull_from_game_check_with_rules()
     
     def pull_from_game_check_with_model(self):
-
-        df = pd.DataFrame(self.all_event_dicts)
-   
-        df['hit'] = df[['single','double','homerun']].max(axis =1)
-        df['curr_inning'] = df.groupby('game_idx').inning.transform(lambda x:x==x.max())
-        inning_df = df[df.curr_inning]
-
-        df=df.groupby('game_idx')\
-            .agg(inning=('inning','max'),
-                 runs=('runs','last'),
-                 homerun=('homerun','last'),
-                 pitcher_at_bat_number=('inning',len),
-                 walk=('walk','last'),
-                 single=('single','last'),
-                 double=('double','last'),
-                 strikeout=('strikeout','last'),
-                 hit=('hit','last'),
-                 out=('out','last'),
-                 runs_this_game=('runs','sum'),
-                 outs_recorded_this_game=('out','sum'),
-                 hits_this_game=('hit','sum'),
-                 homeruns_this_game=('homerun','sum'),
-                 doubles_this_game=('double','sum'),
-                singles_this_game=('single','sum'),
-                walks_this_game=('walk','sum'),
-                strikeouts_this_game=('strikeout','sum')).reset_index()
-
         
-        inning_df=inning_df.groupby(['game_idx']).agg(
-                runs_this_inning=('runs','sum'),
-                 homeruns_this_inning=('homerun','sum'),
-                 outs_this_inning=('out','sum'),
-                 hits_this_inning=('hit','sum'),
-                 doubles_this_inning=('double','sum'),
-                singles_this_inning=('single','sum'),
-                walks_this_inning=('walk','sum'),
-                strikeouts_this_inning=('strikeout','sum')).reset_index()
+        def zero_out_before_inning(events, start_of_curr_inning, fill):
+            # Create a mask for each row where the indices are to be zeroed
 
-        df = df.merge(inning_df[[x for x in inning_df if 'inning' in x or x=='game_idx']],
-                 how = 'left', on = 'game_idx')
+            events = copy.deepcopy(events)
+            m = events.shape[0]
+            n = events.shape[1]
+            
+            rows = np.arange(m)[:, np.newaxis]  # Shape (m, 1)
+            cols = np.arange(n)  # Shape (n,)
+            mask = cols < np.array(start_of_curr_inning)[rows]  # Broadcasting L to shape (m, n)
+        
+            # Apply the mask to zero out elements in A
+            events[mask] = fill
+            return events
+            
+        columns = ['strikeouts_this_game','fieldouts_this_game','walks_this_game',
+                   'singles_this_game','doubles_this_game','homeruns_this_game']
+        columns_last = ['strikeout','out','walk', 'single','double','homerun']
 
+
+        counts = np.apply_along_axis(lambda x: np.bincount(x, minlength=6),
+                                     axis=1, arr=self.events_arr[:,:self.batter+1])
+        counts_last = np.apply_along_axis(lambda x: np.bincount(x, minlength=6),
+                                     axis=1, arr=self.events_arr[:,self.batter:self.batter+1])
+        
+        df = pd.DataFrame(counts, columns = columns)
+        df_last = pd.DataFrame(counts_last, columns = columns_last)
+
+        df['runs_this_game'] = self.runs_arr[:, :self.batter+1].sum(axis =1)
+        df['hits_this_game'] = df[['singles_this_game','doubles_this_game','homeruns_this_game']].sum(axis =1)
+        df['outs_recorded_this_game'] = df[['fieldouts_this_game','strikeouts_this_game']].sum(axis =1)
+        df['inning'] = self.inning
+        df['runs'] = self.event_runs
+
+        df_last['out'] = df_last['strikeout']+df_last['out']
+        df_last['hit'] = df_last[['single','double','homerun']].sum(axis =1)
+        df=pd.concat([df.reset_index(drop=True),df_last.reset_index(drop=True)], axis =1)
+
+        inning_events_arr = zero_out_before_inning(self.events_arr,
+                                                   start_of_curr_inning=self.curr_inning_start, fill=6)
+        
+        columns = ['strikeouts_this_inning','fieldouts_this_inning','walks_this_inning',
+                   'singles_this_inning','doubles_this_inning','homeruns_this_inning']
+
+        # count of 6s is a dummy count. we get rid of it
+        counts = np.apply_along_axis(lambda x: np.bincount(x, minlength=7),
+                                         axis=1, arr=inning_events_arr[:,:self.batter+1])
+        counts = counts[:,:-1]
+            
+        inning_df = pd.DataFrame(counts, columns = columns)  
+        
+        inning_df['hits_this_inning'] = inning_df[
+            ['singles_this_inning','doubles_this_inning','homeruns_this_inning']].sum(axis =1)
+        
+        inning_df['outs_this_inning'] = inning_df['fieldouts_this_inning']+inning_df['strikeouts_this_inning']
+
+        # zero out entries that arent from this inning.
+        inning_runs_arr = zero_out_before_inning(self.runs_arr, 
+                                                 start_of_curr_inning=self.curr_inning_start, fill=0)
+
+        inning_df['runs_this_inning'] = inning_runs_arr.sum(axis = 1)
+        
+        df=pd.concat([df.reset_index(drop=True), inning_df.reset_index(drop=True)], axis =1)
+        df['pitcher_at_bat_number'] = self.batter
+        
         s =time.time()
         columns = ['inning','runs','homerun','walk','strikeout','hit','out',
                    'pitcher_at_bat_number','runs_this_inning','runs_this_game',
@@ -460,27 +330,155 @@ class Game(object):
         for k,v in self.pull_pitcher_static.items():
             df[k] = v
 
-        return df[columns + self.static_columns].values
+        return df[columns + self.static_columns]
+    
+    def update_state_for_event_model(self, batter):
 
-    def pull_from_game_check_with_rules(self):
-        runners = self.hits + self.walks
-  
-        if self.inning > 8:
-            return True
-        elif self.inning == 8 and (self.runs > 1 or runners > 6):
-            return True
-        elif self.inning == 7 and (self.runs > 2 or runners > 8):
-            return True
-        elif (self.inning == 5 or self.inning == 6) and (self.runs > 3 or runners > 9):
-            return True
-        elif self.inning == 4 and (self.runs > 5 or runners > 9):
-            return True
-        elif (self.inning == 3 or self.inning == 2) and self.runs > 5:
-            return True
-        elif self.inning == 1 and self.runs > 6:
-            return True
+        def zero_out_before_inning(events, start_of_curr_inning):
+            # Create a mask for each row where the indices are to be zeroed
+
+            events = copy.deepcopy(events)
+            m = events.shape[0]
+            n = events.shape[1]
             
-        return False
+            rows = np.arange(m)[:, np.newaxis]  # Shape (m, 1)
+            cols = np.arange(n)  # Shape (n,)
+            mask = cols < np.array(start_of_curr_inning)[rows]  # Broadcasting L to shape (m, n)
+        
+            # Apply the mask to zero out elements in A
+            events[mask] = 6
+            return events
+
+        state_data = {}
+
+        state_data['game_idx'] = range(self.n_games)
+        state_data['inning'] = self.inning
+        state_data['outs_when_up'] = self.outs
+        state_data['on_1b'] = self.runner_on_1b
+        state_data['on_2b'] = self.runner_on_2b
+        state_data['on_3b'] = self.runner_on_3b
+
+        state_data = pd.DataFrame(state_data)
+        
+        categories = ['strikeout', 'walk', 'single','double', 'homerun',  'linear_weight']
+        if batter is None:
+            for category in categories:
+                state_data[f'{category}s_so_far'] = np.nan
+                state_data[f'{category}s_this_inning'] = np.nan
+    
+            # Calculate rolling sum for each category
+            for category in categories:
+                state_data[f'{category}s_last_3'] = np.nan
+                state_data[f'{category}s_last_9'] = np.nan
+    
+            for category in categories:
+                state_data[f'batter_{category}s_today'] = np.nan
+       
+            state_data['batter_last_ab'] = np.nan  
+            state_data['last_ab'] = np.nan
+
+        # Calculate cumulative sum for each category and each inning
+        else:
+
+            columns = ['strikeouts_so_far','fieldouts_so_far','walks_so_far',
+                       'singles_so_far','doubles_so_far','homeruns_so_far']
+            
+            counts = np.apply_along_axis(lambda x: np.bincount(x, minlength=6),
+                                         axis=1, arr=self.events_arr[:,:batter])
+            
+            game_state_df = pd.DataFrame(counts, columns = columns)
+
+            game_state_df['batting_score'] = self.runs_arr[:, :batter].sum(axis = 1)
+            game_state_df['last_ab'] = self.events_arr[:,batter-1]
+            game_state_df['linear_weights_so_far'] = self.linear_weights_arr[:, :batter].sum(axis = 1)
+
+            if batter >= 2:
+
+                columns = ['strikeouts_last_3','fieldouts_last_3','walks_last_3',
+                       'singles_last_3','doubles_last_3','homeruns_last_3']
+            
+                counts = np.apply_along_axis(lambda x: np.bincount(x, minlength=6),
+                                             axis=1, arr=self.events_arr[:,(batter) -3: (batter)])
+                
+                last_3_state_df = pd.DataFrame(counts, columns = columns)
+  
+            else:
+                d={}
+                for k in categories:
+                    d[k+'_last_3'] = [np.nan]*self.n_games
+                last_3_state_df = pd.DataFrame(d)
+                last_3_state_df['linear_weights_last_3'] = self\
+                    .linear_weights_arr[:,(batter) -3: (batter)]\
+                    .sum(axis = 1)
+
+            if batter >= 8:
+
+                columns = ['strikeouts_last_9','fieldouts_last_9','walks_last_9',
+                       'singles_last_9','doubles_last_9','homeruns_last_9']
+            
+                counts = np.apply_along_axis(lambda x: np.bincount(x, minlength=6),
+                                             axis=1, arr=self.events_arr[:,(batter) -9: (batter)])
+                
+                last_9_state_df = pd.DataFrame(counts, columns = columns)
+                last_9_state_df['linear_weights_last_9'] = self\
+                    .linear_weights_arr[:,(batter) -9: (batter)]\
+                    .sum(axis = 1)
+
+            else:
+                d={}
+                for k in categories:
+                    d[k+'_last_9'] = [np.nan]*self.n_games
+                last_9_state_df = pd.DataFrame(d)
+
+            
+            inning_events_arr = zero_out_before_inning(self.events_arr, start_of_curr_inning=self.curr_inning_start)
+            columns = ['strikeouts_this_inning','fieldouts_this_inning','walks_this_inning',
+                       'singles_this_inning','doubles_this_inning','homeruns_this_inning']
+
+            # count of 6s is a dummy count. we get rid of it
+            counts = np.apply_along_axis(lambda x: np.bincount(x, minlength=7),
+                                             axis=1, arr=inning_events_arr[:,:batter])
+            counts = counts[:,:-1]
+                
+            inning_state_df = pd.DataFrame(counts, columns = columns)
+            inning_state_df['linear_weights_this_inning'] = .55*inning_state_df.walks_this_inning+ \
+                .7*inning_state_df.singles_this_inning+1*inning_state_df.doubles_this_inning+\
+                1.65*inning_state_df.homeruns_this_inning
+            
+            if batter < 9:
+ 
+                d={}
+                d['batter_last_ab'] = [np.nan]*self.n_games
+
+                for k in categories:
+                    d[f'batter_{k}s_today'] = [np.nan]*self.n_games
+                    
+                batter_df = pd.DataFrame(d)
+                
+            else:
+                batter_last_ab = self.events_arr[:, batter - 9]
+
+                indices = list(range(batter % 9, batter, 9))
+           
+                columns = ['batter_strikeouts_today','batter_fieldouts_today','batter_walks_today',
+                           'batter_singles_today','batter_doubles_today','batter_homeruns_today']
+                
+                counts = np.apply_along_axis(lambda x: np.bincount(x, minlength=6),
+                                                 axis=1, arr=self.events_arr[:,indices])
+                    
+                batter_df = pd.DataFrame(counts, columns = columns)
+                batter_df['batter_last_ab'] = batter_last_ab
+                batter_df['batter_linear_weights_today'] = self.linear_weights_arr[:, indices].sum(axis = 1)
+
+
+            state_data = pd.concat([state_data.reset_index(drop=True), 
+                       batter_df.reset_index(drop=True),
+                       game_state_df.reset_index(drop=True),
+                       inning_state_df.reset_index(drop=True),
+                       last_3_state_df.reset_index(drop=True),
+                       last_9_state_df.reset_index(drop=True)], axis = 1)
+
+        return state_data   
         
     def print_game_state(self, event):
 
@@ -514,23 +512,23 @@ class Game(object):
         self.reset_state()
         s1 = time.time()
 
-        s = time.time()
-        for batter in range(sim_arr.shape[0]):
+        N = sim_arr.shape[0]
+        for batter in range(N):
 
-
+            s = time.time()
+            self.batter = batter
+            
             pitcher_data = sim_arr[batter]
             pitcher_data = pd.DataFrame(pitcher_data, columns = columns)
             pitcher_data = pitcher_data.drop(columns = \
                                 [x for x in self.state_df.columns if x in pitcher_data.columns])
 
-            
-            pitcher_data['game_idx'] = range(self.n_games)
 
-            pitcher_data = pitcher_data.merge(self.state_df, how = 'left', on = 'game_idx')
+            pitcher_data = pd.concat([pitcher_data.reset_index(drop=True), 
+                                      self.state_df.reset_index(drop=True)], axis = 1)
 
-            event_probas = self.predict_event(pitcher_data, self.platt_models)
+            event_probas = self.predict_event(pitcher_data)
 
-            #print('probas are', event_probas)
             events = []
             for probas in event_probas:
                 event = np.random.multinomial(1, probas).argmax()
@@ -542,13 +540,7 @@ class Game(object):
             walk_indices = np.where(np.array(events)==2, True, False)
             field_out_indices = np.where(np.array(events)==1, True, False)
             strikeout_indices = np.where(np.array(events)==0, True, False)
-            
-            self.all_event_dicts['batter'] += self.n_games*[batter]
-            self.all_event_dicts['inning'] += list(self.inning)
-            self.all_event_dicts['event'] += list(events)
-            self.all_event_dicts['game_idx'] += list(range(self.n_games))
 
-            
             self.record_strike_out(strikeout_indices)
             self.record_field_out(field_out_indices)
             self.record_walk(walk_indices)
@@ -556,31 +548,23 @@ class Game(object):
             self.record_double(double_indices)
             self.record_homerun(homerun_indices)
 
-            out_indices = np.logical_or(field_out_indices, strikeout_indices)
+            self.runs_arr[:,batter] = self.event_runs
+            
+            self.events_arr[:, batter] = np.array(events).astype(int)
+            self.linear_weights_arr[:, batter] = \
+                .55*walk_indices+.7*single_indices+1*double_indices+1.65*homerun_indices
 
-            self.all_event_dicts['runs']+=list(self.event_runs)
-            self.all_event_dicts['out']+=list(out_indices.astype(int))
-            self.all_event_dicts['strikeout']+=list(strikeout_indices.astype(int))
-            self.all_event_dicts['walk']+=list(walk_indices.astype(int))
-            self.all_event_dicts['single']+=list(single_indices.astype(int))
-            self.all_event_dicts['double']+=list(double_indices.astype(int))
-            self.all_event_dicts['triple']+=[0]*self.n_games
-            self.all_event_dicts['homerun']+=list(homerun_indices.astype(int))
+            self.state_df = self.update_state_for_event_model(batter + 1)
+            pull_row = self.pull_from_game_check_with_model()
 
             self.event_runs = np.zeros(self.n_games)
-
-            #for game_idx, event in enumerate(events):    
-            self.state_df = self.update_state_for_event_model((batter + 1) % 9)
-                
-            pull_arr = self.pull_from_game_check_with_model()
-            self.pull_pitcher_data[:,batter, :] = pull_arr
-
+            self.pull_pitcher_data[:,batter, :] = pull_row.values
+            
         print('game', time.time()-s1)
 
-        l=[]
+         
+        s=time.time()
 
-        column_names =['runs','strikeouts','hits','homeruns','walks','outs_recorded']
-        d={k:[] for k in  column_names}
 
         pull_pitcher_data = self.pull_pitcher_data.reshape(
             self.pull_pitcher_data.shape[0]*self.pull_pitcher_data.shape[1], -1)
@@ -593,25 +577,53 @@ class Game(object):
         
         pull_by_game = np.argmax(pull_indices, axis = 1)
 
-        #print(pull_by_game)
-        df = pd.DataFrame(self.all_event_dicts)
-        df['hit'] = df[['single','double','triple','homerun']].max(axis=1)
+        def zero_out_after_game_end(events, end_of_game):
+            # Create a mask for each row where the indices are to be zeroed
 
-        l = []
-        for game_idx, pull_idx in enumerate(pull_by_game):
-            sub_df = df[df.game_idx==game_idx].iloc[:pull_idx]
-            l.append(sub_df)
+            events = copy.deepcopy(events)
+            m = events.shape[0]
+            n = events.shape[1]
+            
+            rows = np.arange(m)[:, np.newaxis]  # Shape (m, 1)
+            cols = np.arange(n)  # Shape (n,)
+            mask = cols > np.array(end_of_game)[rows]  # Broadcasting L to shape (m, n)
+        
+            # Apply the mask to zero out elements in A
+            events[mask] = 0
+            return events
 
-        df = pd.concat(l)
-        df = df[['runs','strikeout','hit','homerun','walk','out', 'game_idx']]\
-            .rename(columns={'strikeout':'strikeouts','hit':'hits','homerun':'homeruns',
-                             'walk':'walks','out':'outs_recorded'})\
-            .groupby('game_idx')\
-            .agg('sum')
+        end_of_game_arr = zero_out_after_game_end(self.events_arr, pull_by_game)
+        columns = ['strikeouts','fieldouts','walks', 'singles','doubles','homeruns']
 
+        # count of 6s is a dummy count. we get rid of it
+        counts = np.apply_along_axis(lambda x: np.bincount(x, minlength=6),
+                                             axis=1, arr=end_of_game_arr[:,:batter])
+                
+        df = pd.DataFrame(counts, columns = columns)
+        df['hits'] = df[['singles','doubles','homeruns']].sum(axis=1)
+        df['outs_recorded'] = df.fieldouts+df.strikeouts
+
+        
         return df
 
-
+def coerce_numeric(df):
+    def safe_to_numeric(series):
+        try:
+            return pd.to_numeric(series)
+        except (ValueError, TypeError):
+            return series
+        
+    if 'index' in df.columns:
+        df=df.drop(columns='index')
+    for col in df.columns:
+        if not pd.api.types.is_datetime64_any_dtype(df[col]):
+            if df[col].dtype == object and df[col].astype(str).str.endswith('%').any():
+                # Handle string percentages
+                df[col] = pd.to_numeric(df[col].astype(str).str.rstrip('%')).div(100)
+            else:
+                # Coerce other columns to numeric if possible
+                df[col] = safe_to_numeric(df[col])
+    return df
 
 def super_simple_simulation(pred_columns,
                             batter_columns,
@@ -681,7 +693,8 @@ def super_simple_simulation(pred_columns,
 
 
     prior_pitcher_df = pitcher_df[pitcher_df.game_date <= pitcher_game_date]
-    next_3_df = prior_pitcher_df[[x for x in pitcher_df.columns if 'next_3' in x] + ['game_date','pitcher_at_bat_number']]
+    next_3_df = prior_pitcher_df[[x for x in pitcher_df.columns if 'next_3' in x] + \
+        ['game_date','pitcher_at_bat_number']]
     next_3_df = next_3_df.sort_values('game_date')
     next_3_df = \
         next_3_df.groupby('pitcher_at_bat_number').last().reset_index().sort_values('pitcher_at_bat_number')
@@ -733,6 +746,8 @@ def super_simple_simulation(pred_columns,
     pitcher_df_rep['game_number'] = sum([[i]*9*n_at_bats for i in range(n_samples)], [])
 
     at_bat_df = pitcher_df_rep.merge( lineup_df, how = 'left', on = 'batter')
+
+    at_bat_df = coerce_numeric(at_bat_df)
 
     at_bat_df['homerun_intensity'] = at_bat_df['homerun_batter'].fillna(0) +\
         at_bat_df['homerun_pitcher'].fillna(0)
@@ -834,6 +849,7 @@ def process_row(row, game_sim_obj,
     except:
         print('couldnt find for player', row['player_name'], 'and date', row['game_date'])
         traceback.print_exc()
+        time.sleep(3)
         return None
 
 def callback(result):
@@ -924,17 +940,16 @@ state_columns = [
 
 
 if __name__ == '__main__':
+
+    run_name = '2024'
+    model_run_name = 'pilot'
+
+    train_pitches = pd.read_parquet(f'intermediate_data_files/{run_name}/data_with_pitch_values.parquet')
     
-    train_pitches = pd.read_parquet('data_with_pitch_values.parquet')
-    train_pitches = train_pitches[train_pitches.game_date>=pitch_model_train_cutoff]
+    data_for_pitcher_pull = prep_data_for_pitcher_pull(train_pitches)
     
-    train_pitches = train_pitches.sort_values(['game_date','at_bat_number','pitch_number'])
     
-    train_pitches['at_bat_change'] = \
-        (train_pitches.groupby(['pitcher','game_date']).at_bat_number.diff().fillna(0)!=0)
-    
-    train_pitches['pitcher_at_bat_number'] = train_pitches\
-        .groupby(['pitcher','game_date']).at_bat_change.transform('cumsum') + 1
+
     
     train_pitches.strikeout = np.where(train_pitches.end_of_at_bat, train_pitches.strikeout, np.nan)
     train_pitches.walk = np.where(train_pitches.end_of_at_bat, train_pitches.walk, np.nan)
@@ -959,127 +974,22 @@ if __name__ == '__main__':
     train_pitches['team_at_bat_number'] = train_pitches\
         .groupby(['inning_topbot','game_date','home_team']).at_bat_change.transform('cumsum') + 1
         
-    data_for_pitcher_pull = train_pitches[train_pitches.end_of_at_bat].copy(deep=True)
-    
-    data_for_pitcher_pull = data_for_pitcher_pull.sort_values(
-        ['game_date','pitcher','pitcher_at_bat_number'])
-    
-    
-    data_for_pitcher_pull['is_start'] = data_for_pitcher_pull \
-        .groupby(['pitcher','game_date']).inning.transform('min') == 1
-    
-    data_for_pitcher_pull['month'] = data_for_pitcher_pull.game_date.dt.month
-    data_for_pitcher_pull['day'] = data_for_pitcher_pull.game_date.dt.day
-    
-    #data_for_pitcher_pull = data_for_pitcher_pull[np.logical_or(
-    #    data_for_pitcher_pull.month>4, data_for_pitcher_pull.day > 10)]
-    
-    data_for_pitcher_pull = data_for_pitcher_pull[data_for_pitcher_pull.is_start]
-    
-    data_for_pitcher_pull['runs_this_inning'] = data_for_pitcher_pull \
-        .groupby(['pitcher','inning', 'game_date']).runs.transform('cumsum')
-    
-    data_for_pitcher_pull['runs_this_game'] = data_for_pitcher_pull \
-        .groupby(['pitcher', 'game_date']).runs.transform('cumsum')
-    
-    data_for_pitcher_pull['outs_recorded_this_game'] = data_for_pitcher_pull \
-        .groupby(['pitcher', 'game_date']).out.transform('cumsum').clip(0,27)
-    
-    data_for_pitcher_pull['outs_this_inning'] = data_for_pitcher_pull \
-        .groupby(['pitcher','inning', 'game_date']).out.transform('cumsum').clip(0,3)
-    
-    data_for_pitcher_pull['homeruns_this_inning'] = data_for_pitcher_pull \
-        .groupby(['pitcher','inning', 'game_date']).homerun.transform('cumsum')
-    
-    data_for_pitcher_pull['homeruns_this_game'] = data_for_pitcher_pull \
-        .groupby(['pitcher','game_date']).homerun.transform('cumsum')
-    
-    data_for_pitcher_pull['hits_this_inning'] = data_for_pitcher_pull \
-        .groupby(['pitcher','inning', 'game_date']).hit.transform('cumsum')
-    
-    data_for_pitcher_pull['hits_this_game'] = data_for_pitcher_pull \
-        .groupby(['pitcher','game_date']).hit.transform('cumsum')
-    
-    data_for_pitcher_pull['walks_this_game'] = data_for_pitcher_pull \
-        .groupby(['pitcher','game_date']).walk.transform('cumsum')
-    
-    data_for_pitcher_pull['walks_this_inning'] = data_for_pitcher_pull \
-        .groupby(['pitcher','inning', 'game_date']).walk.transform('cumsum')
-    
-    data_for_pitcher_pull['strikeouts_this_game'] = data_for_pitcher_pull \
-        .groupby(['pitcher','game_date']).strikeout.transform('cumsum')
-    
-    data_for_pitcher_pull['strikeouts_this_inning'] = data_for_pitcher_pull \
-        .groupby(['pitcher','inning', 'game_date']).strikeout.transform('cumsum')
-    
-    
-    data_for_pitcher_pull = data_for_pitcher_pull[['inning','pitcher','player_name','runs',
-                            'homerun','walk','strikeout','hit',
-                           'out', 'pitcher_at_bat_number','game_date','batter'] + \
-        [x for x in data_for_pitcher_pull if 'this_game' in x or 'this_inning' in x]]
-    
-    
-    data_for_pitcher_pull['total_outs_recorded_by_end_of_game'] = data_for_pitcher_pull\
-        .groupby(['pitcher','game_date']).outs_recorded_this_game.transform('max')
-    
-    df_for_perc = data_for_pitcher_pull.drop_duplicates(['game_date','pitcher']).copy(deep=True)
-    
-    for perc in [.05, .25,.5, .75, .95]:
-        
-        cumulative_percentile_by_group = df_for_perc\
-            .groupby('pitcher')['total_outs_recorded_by_end_of_game'].expanding().quantile(perc)
-        
-        # Add the result as a new column
-        df_for_perc[f'total_outs_recorded_{int(perc*100)}_perc'] = \
-            cumulative_percentile_by_group.reset_index(level=0, drop=True)
-        
-    perc_columns = [x for x in df_for_perc.columns if '_perc' in x]
-    data_for_pitcher_pull = data_for_pitcher_pull\
-        .merge(df_for_perc[perc_columns + ['game_date','pitcher']],
-                                how = 'left', on=['game_date','pitcher'])
-    
-    data_for_pitcher_pull['max_outs_recorded_by_end_of_game'] = data_for_pitcher_pull\
-        .groupby(['pitcher']).total_outs_recorded_by_end_of_game.transform(np.maximum.accumulate)
-    
-    data_for_pitcher_pull['min_outs_recorded_by_end_of_game'] = data_for_pitcher_pull\
-        .groupby(['pitcher']).total_outs_recorded_by_end_of_game.transform(np.minimum.accumulate)
-    
-    
-    cumulative_mean_func = lambda x: x.cumsum() / range(1, len(x) + 1)
-    data_for_pitcher_pull['mean_recorded_by_end_of_game'] = data_for_pitcher_pull \
-        .groupby(['pitcher','inning']).total_outs_recorded_by_end_of_game.transform(cumulative_mean_func)
-    
-    
-    data_for_pitcher_pull.drop(columns='total_outs_recorded_by_end_of_game', inplace=True)
-    data_for_pitcher_pull['pulled'] = data_for_pitcher_pull.groupby([
-        'pitcher','game_date']).pitcher_at_bat_number.transform(lambda x: x == max(x))
-    
-    from engineer_features import train_xgboost
-    meta = ['pitcher','player_name','game_date','batter']
-    target = 'pulled'
-    
-    pull_pitcher_cols = [x for x in data_for_pitcher_pull.columns if x not in meta+[target]]
-    X_pulled_train = data_for_pitcher_pull[data_for_pitcher_pull.game_date<='2023-06-01']
-    X_pulled_test = data_for_pitcher_pull[data_for_pitcher_pull.game_date>='2023-06-01']
-    
-    
-    xg_model_pull = train_xgboost(data_for_pitcher_pull,
-                  target_column='pulled',
-                  pred_columns=pull_pitcher_cols,
-                  categorical_columns=None,
-                  multiclass=False)
+    print(data_for_pitcher_pull.game_date.max(), 'is pull date max')
+    print(train_pitches.game_date.max(), 'is train pitches date max')
+    with open(f'pull_pitcher_models/{model_run_name}/model.pkl','rb') as f:
+        xg_model_pull = pickle.load(f)
 
     
-    with open('data_for_ordinal_fangraphs.pkl','rb') as f:
+    with open(f'intermediate_data_files/{run_name}/data_for_ordinal_fangraphs.pkl','rb') as f:
         d = pickle.load(f)
     
     meta_cols =['player_name','pitcher','batter','game_date','batting_team']
-    xtrain_enc = d['x_train']
-    xmeta = d['x_meta_train'][meta_cols]
+    xtrain_enc = d['X']
+    xmeta = d['X_meta'][meta_cols]
     train_data = pd.concat([xmeta.reset_index(drop=True), xtrain_enc.reset_index(drop=True)], axis = 1)
 
     
-    with open('booster_event_models/best_model_history.pkl','rb') as f:
+    with open(f'booster_event_models/{model_run_name}/best_model_history.pkl','rb') as f:
         d = pickle.load(f)
     
     xg_model = d['model']
@@ -1123,17 +1033,14 @@ if __name__ == '__main__':
                                          game_map.home_team)
     
     
-    game_map = game_map[game_map.game_date>='2022-01-01']
-    game_map = game_map[game_map.game_date>='2023-06-18']
+
+    game_map = game_map[game_map.game_date>='2024-01-01']
     #game_map = game_map[np.logical_or(game_map.game_date <= '2023-01-01',
     #                                  game_map.game_date>='2023-04-10')]
 
     n_samples = 100
     game_sim_obj = Game(n_samples)
-    game_sim_obj.setup_event_model(xg_model,
-                               pred_columns=pred_columns,
-                               categorical_columns=['last_ab', 'batter_last_ab'],
-                               one_hot_encoder=None, platt_models=None)
+    game_sim_obj.setup_event_model(xg_model)
     
 
     process_row_partial = partial(process_row, game_sim_obj=game_sim_obj,
@@ -1144,7 +1051,6 @@ if __name__ == '__main__':
                                  batter_columns=batter_columns)
 
     all_results = []
-    #with Pool(32) as p:
     chunk_size = 10
     for idx_start in range(0, game_map.shape[0], chunk_size):
 
@@ -1157,12 +1063,9 @@ if __name__ == '__main__':
             print(x)
             results.append(process_row_partial(x))
 
-        #rows = [row for idx, row in chunk.iterrows()]
-        #results = p.map(process_row_partial, rows)
-            
         all_results += results
         print('done with chunk',idx_start)
-        with open('sims2.pkl','wb') as f:
+        with open('sims_2024.pkl','wb') as f:
             pickle.dump(all_results,f)
     
     print(f'Processed simulations')

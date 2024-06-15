@@ -1,13 +1,12 @@
 
 ball_strike_model_train_cutoff = '2020-01-01'
 pitch_model_train_cutoff = '2020-01-01'
-event_model_train_cutoff = '2023-01-01'
+event_model_train_cutoff = '2023-07-01'
 
 xgboost_ball_strike_pred_columns = ['zone', 'pitch_type', 'plate_z', 'plate_x', 'pfx_x', 'pfx_z', 'on_edge_left', 'on_edge_right', 'on_edge_top', 'on_edge_bot', 'on_edge_inside', 'on_edge_outside', 'on_low_inside_corner', 'on_low_outside_corner', 'on_high_inside_corner', 'on_high_outside_corner', 'on_edge', 'on_corner']
 
 # i dont get to look at anything besides
-xgboost_benchmark_columns = ['stand', 'p_throws', 'balls', 'strikes', 'count_value', 
- 'strike_value', 'ball_value']
+xgboost_benchmark_columns = ['stand', 'p_throws', 'balls', 'strikes', 'count_value', 'strike_value', 'ball_value']
 
 xgboost_pred_columns = [
  'release_speed',
