@@ -1,2 +1,15 @@
 .parquet
 .ipynb_checkpoints
+
+# Ignore Python compiled files
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore virtual environments
+venv/
+env/
+
+# Ignore __pycache__ directories recursively
+**/__pycache__/
+**/.DS_Store/
