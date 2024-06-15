@@ -725,7 +725,7 @@ def assemble_event_model_data(pitch_values, train_pitches):
     cols += [x for x in pitch_values.columns if 'whiff' in x or 'called_strike' in x 
              or 'strikeout' in x or 'homerun' in x or 'woba' in x or 'walk' in x or '_RA9' in x]
     
-    cols += [ 'is_CU','is_SL','is_FF_2','is_FF_1','is_SI','is_CH']
+    cols += [x for x in pitch_values.columns if 'is_'==x[:3]]
     pitch_values['time_thru_the_order'] = pitch_values.pitcher_at_bat_number//9 + 1
     pitch_values = pitch_values[cols]
     
@@ -920,24 +920,17 @@ def assemble_event_model_data(pitch_values, train_pitches):
 
     train_data['time_thru_the_order'] = train_data.pitcher_at_bat_number//9 + 1
 
-    xtrain = train_data[train_data.game_date<=event_model_train_cutoff]
-    xtest = train_data[train_data.game_date>event_model_train_cutoff]
-    train_label = xtrain.label
-    test_label = xtest.label
-    
     categorical_columns=['last_ab','batter_last_ab']
     meta_columns = ['player_name','pitcher','batter', 'game_date','inning_topbot','batting_team']
     
     pred_columns = [x for x in train_data.columns 
                     if x!='label' and x not in meta_columns and x!='index']
     
-    xtrain_enc = one_hot_encode_data(one_hot_encoder, xtrain[pred_columns],
-                                 categorical_columns)
-    xtest_enc = one_hot_encode_data(one_hot_encoder, xtest[pred_columns], 
-                                 categorical_columns)
+    X_enc = one_hot_encode_data(one_hot_encoder, train_data[pred_columns], categorical_columns)
+    Y = train_data.label
+    
+    X_meta = train_data[meta_columns+['team_at_bat_number', 'inning']]
 
-    x_meta_train = xtrain[meta_columns+['team_at_bat_number', 'inning']]
-    x_meta_test = xtest[meta_columns+['team_at_bat_number', 'inning']]
 
     adaptive_label_data = train_data[['label']+ ['game_date','team_at_bat_number','pitcher','batter']]\
         .merge(
@@ -949,13 +942,9 @@ def assemble_event_model_data(pitch_values, train_pitches):
 
     adaptive_label_data = adaptive_label_data\
         .dropna(subset=['label', 'launch_angle']).sort_values('label')
-    
-    adaptive_label_train = adaptive_label_data[adaptive_label_data.game_date<=event_model_train_cutoff]
-    adaptive_label_test = adaptive_label_data[adaptive_label_data.game_date>event_model_train_cutoff]
 
-    data_dict = {'x_train':xtrain_enc, 'y_train':train_label, 'adaptive_label_train':adaptive_label_train,
-                     'x_test':xtest_enc, 'y_test':test_label, 'adaptive_label_test':adaptive_label_test,
-                     'x_meta_train':x_meta_train, 'x_meta_test':x_meta_test}
+
+    data_dict = {'X':X_enc, 'Y':Y, 'adaptive_label_data':adaptive_label_data, 'X_meta':X_meta}
 
     return data_dict
 

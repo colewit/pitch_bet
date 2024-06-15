@@ -103,6 +103,7 @@ def calculate_class_weights(y_train):
 
 
 def run_grid_search(data_dict,
+                    train_cutoff,
                     boost_rounds=300,
                     max_depth=4,
                     patience=10,
@@ -112,17 +113,29 @@ def run_grid_search(data_dict,
                     adaptive_label_model_pipeline=None,
                     model_folder = 'saved_boosters'):
     
-    x_meta = data_dict['x_meta_train']
-    X = data_dict['x_train'].astype(float)
-    train_label = data_dict['y_train'].astype(int)
-
+    X_meta = data_dict['X_meta']
+    X = data_dict['X'].astype(float)
+    label = data_dict['Y'].astype(int)
     
 
     columns = [x for x in X.columns if 'index' not in x and x!='month' and x!='year']
     X = X[columns]
     
     num_features = X.shape[1]
-    num_classes = len(np.unique(train_label))
+    num_classes = len(np.unique(label))
+
+
+    train_indices = np.where(X_meta.game_date<=train_cutoff)[0]
+    test_indices = np.where(X_meta.game_date>train_cutoff)[0]
+    
+    X_test = X.iloc[test_indices]
+    X = X.iloc[train_indices]
+    
+    X_meta_test = X_meta.iloc[test_indices]
+    X_meta = X_meta.iloc[train_indices]
+
+    train_label = np.array(label)[train_indices]
+    test_label = np.array(label)[test_indices]
     
     if cheng_labels:    
         y = get_cheng_labels(train_label.astype(int), num_classes)
@@ -142,7 +155,10 @@ def run_grid_search(data_dict,
                     'launch_angle', 'launch_speed', 'estimated_ba_using_speedangle']
 
         meta = ['game_date','team_at_bat_number','pitcher','batter']
-        X_adaptive_labels = data_dict['adaptive_label_train'][features+meta].dropna()
+
+        print({k:v.shape for k,v in data_dict.items()})
+        X_adaptive_labels = data_dict['adaptive_label_data'][features+meta]
+        X_adaptive_labels = X_adaptive_labels.dropna()   
         
         proba_df = pd.DataFrame(
             adaptive_label_model_pipeline.predict_proba(X_adaptive_labels[features]),
@@ -150,85 +166,95 @@ def run_grid_search(data_dict,
         
         proba_df = pd.concat([proba_df, X_adaptive_labels[meta].reset_index(drop=True)], axis = 1)
 
-        proba_df = x_meta.merge(proba_df, 
+        full_proba_df = X_meta.merge(proba_df, 
                      how = 'left', 
                      on = ['game_date','team_at_bat_number','pitcher','batter'])
 
-        X_train, X_final_val, y_train, y_final_val, x_meta_train, x_meta_test, proba_df_train, proba_df_test = \
-            train_test_split(X, y, x_meta, proba_df, test_size=0.2, random_state=42)
+        X_train, X_final_val, y_train, y_final_val, X_meta_train, X_meta_val, proba_df_train, proba_df_val = \
+            train_test_split(X, y, X_meta, full_proba_df, test_size=0.2, random_state=42)
     else:
-        X_train, X_final_val, y_train, y_final_val, x_meta_train, x_meta_test = \
-            train_test_split(X, y, x_meta, test_size=0.2, random_state=42)
+        X_train, X_final_val, y_train, y_final_val, X_meta_train, X_meta_val = \
+            train_test_split(X, y, X_meta, test_size=0.2, random_state=42)
 
-    for lr in np.logspace(-2,-1, 3):
-
-        
-        try:
-            print("running for LR", lr)
-
-            bootstrapped_labels_train = sample_events_multinomial(proba_df_train)
-            bootstrapped_labels_test = sample_events_multinomial(proba_df_test)
-            
-            labels_arr_train = np.where(np.isnan(bootstrapped_labels_train),
-                                  y_train, bootstrapped_labels_train)
-            
-            labels_arr_test = np.where(np.isnan(bootstrapped_labels_test),
-                                  y_final_val, bootstrapped_labels_test)
-            
-            dtrain = xgb.DMatrix(X_train, label=labels_arr_train)
-            dval = xgb.DMatrix(X_final_val, label=labels_arr_test)
-
-            param = {
-                'max_depth': max_depth,
-                'eta': lr,
-                'objective': 'multi:softprob',
-                'num_class': num_classes-1,
-                'disable_default_eval_metric':True
-            }
-
-            evallist = [(dval, 'eval')]
-
-            custom_loss_fn = create_corn_obj_xgb(labels_arr_train.astype(int), num_classes)
+    for max_depth in [3,4,5,6,8,10]:
+        for lr in [.005, .01, .05, .1]:
     
-            custom_eval_fn = create_corn_eval_xgb(labels_arr_test.astype(int), num_classes)
             
-            bst = xgb.train(param, dtrain, boost_rounds, evallist,
-                            early_stopping_rounds=patience, 
-                            obj=custom_loss_fn,
-                            custom_metric=custom_eval_fn)
-
-            val_loss = bst.best_score
-            
-
-            # Save the model
-            model_hist = {
-                'model':bst,
-                'learning_rate': lr,
-                'max_depth': max_depth,
-                'valid_loss': val_loss
-            }
-
-            model_hist_name = f'best_model_lr_{lr}_history.pkl'
-            model_hist_path = os.path.join(model_folder.rstrip('/'), model_hist_name)
-            with open(model_hist_path, 'wb') as f:
-                pickle.dump(model_hist, f)
-        
-            if val_loss < best_val_loss:
+            try:
+                print("running for LR", lr)
     
-                best_val_loss = val_loss
-
-                model_hist_name = f'best_model_history.pkl'
+                bootstrapped_labels_train = sample_events_multinomial(proba_df_train)
+                bootstrapped_labels_val = sample_events_multinomial(proba_df_val)
+                
+                labels_arr_train = np.where(np.isnan(bootstrapped_labels_train),
+                                      y_train, bootstrapped_labels_train)
+                
+                labels_arr_val = np.where(np.isnan(bootstrapped_labels_val),
+                                      y_final_val, bootstrapped_labels_val)
+    
+    
+                print(X_train.shape, labels_arr_train.shape)
+                print(X_final_val.shape, labels_arr_val.shape)
+                print(X_test.shape, test_label.shape)
+                
+                dtrain = xgb.DMatrix(X_train, label=labels_arr_train)
+                dval = xgb.DMatrix(X_final_val, label=labels_arr_val)
+                dtest = xgb.DMatrix(X_test, label = test_label)
+                
+                param = {
+                    'max_depth': max_depth,
+                    'eta': lr,
+                    'objective': 'multi:softprob',
+                    'num_class': num_classes-1,
+                    'disable_default_eval_metric':True
+                }
+    
+                evallist = [(dval, 'eval')]#, (dtest, 'test')]
+    
+                custom_loss_fn = create_corn_obj_xgb(labels_arr_train.astype(int), num_classes)
+        
+                custom_eval_fn = create_corn_eval_xgb(labels_arr_val.astype(int), num_classes)
+    
+                evals_result = {}
+                bst = xgb.train(param, dtrain, boost_rounds, evallist,
+                                early_stopping_rounds=patience, 
+                                obj=custom_loss_fn,
+                                custom_metric=custom_eval_fn,
+                                evals_result=evals_result)
+    
+                val_loss = bst.best_score
+    
+                #test_loss = evals_result['test']['corn_loss']
+                
+                # Save the model
+                model_hist = {
+                    'model':bst,
+                    'learning_rate': lr,
+                    'max_depth': max_depth,
+                    'valid_loss': val_loss
+                }
+    
+                model_hist_name = f'best_model_lr_{lr}_max_depth_{max_depth}_history.pkl'
                 model_hist_path = os.path.join(model_folder.rstrip('/'), model_hist_name)
-
-                # Save the fully trained model
                 with open(model_hist_path, 'wb') as f:
                     pickle.dump(model_hist, f)
-  
-
-        except:
             
-            traceback.print_exc()
-            continue
+                if val_loss < best_val_loss:
+        
+                    best_val_loss = val_loss
+    
+                    model_hist_name = f'best_model_history.pkl'
+                    model_hist_path = os.path.join(model_folder.rstrip('/'), model_hist_name)
+    
+                    # Save the fully trained model
+                    with open(model_hist_path, 'wb') as f:
+                        pickle.dump(model_hist, f)
+      
+    
+            except:
+                
+                traceback.print_exc()
+                continue
             
     print('training of boosters completed')
 

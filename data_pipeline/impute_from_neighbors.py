@@ -40,25 +40,23 @@ def get_distance_matrix(vals1, vals2, weights1, weights2):
 
 
 
-def dist_between_pitchers(df, pitch_distance_df):
+def dist_between_pitchers(df, pitch_distance_df, pitch_types):
 
     weighted_dist = np.zeros((df.shape[0], df.shape[0]))
-
-        
-    for pt1 in ['CH', 'CU', 'FF_1', 'FF_2','SI', 'SL']:
+    for pt1 in pitch_types:
 
         
         wd_for_pitch = []
         
-        for pt2 in ['CH', 'CU', 'FF_1', 'FF_2','SI', 'SL']:
+        for pt2 in pitch_types:
 
-            if pt1 in ['CU','SL'] and pt2 in ['FF_1','FF_2','SI', 'CH']:
+            if pt1[:2] in ['CU','SL'] and pt2[:2] in ['FF','FF','SI', 'CH']:
                 continue
-            elif pt2 in ['CU','SL'] and pt1 in ['FF_1','FF_2','SI', 'CH']:
+            elif pt2[:2] in ['CU','SL'] and pt1[:2] in ['FF','FF','SI', 'CH']:
                 continue
-            elif pt1 == 'CH' and pt2 not in ['SI', 'CH']:
+            elif pt1[:2] == 'CH' and pt2[:2] not in ['SI', 'CH']:
                 continue
-            elif pt2 == 'CH' and pt1 not in ['SI', 'CH']:
+            elif pt2[:2] == 'CH' and pt1[:2] not in ['SI', 'CH']:
                 continue
             
             curr_dist = np.zeros((df.shape[0],df.shape[0]))
@@ -86,52 +84,7 @@ def dist_between_pitchers(df, pitch_distance_df):
     return weighted_dist
 
 
-def dist_between_pitchers(df, pitch_distance_df):
-
-    weighted_dist = np.zeros((df.shape[0], df.shape[0]))
-
-        
-    for pt1 in ['CH', 'CU', 'FF_1', 'FF_2','SI', 'SL']:
-
-        
-        wd_for_pitch = []
-        
-        for pt2 in ['CH', 'CU', 'FF_1', 'FF_2','SI', 'SL']:
-
-            if pt1 in ['CU','SL'] and pt2 in ['FF_1','FF_2','SI', 'CH']:
-                continue
-            elif pt2 in ['CU','SL'] and pt1 in ['FF_1','FF_2','SI', 'CH']:
-                continue
-            elif pt1 == 'CH' and pt2 not in ['SI', 'CH']:
-                continue
-            elif pt2 == 'CH' and pt1 not in ['SI', 'CH']:
-                continue
-            
-            curr_dist = np.zeros((df.shape[0],df.shape[0]))
-            
-            for column in ['pred_pitch_value_cmd_RA9_pitch_type',
-                   'pred_pitch_value_stuff_RA9_pitch_type',
-                   'empirical_pitch_value_RA9_pitch_type']:
-               
-                curr_dist += get_distance_matrix(df[f'{column}_{pt1}'],
-                                              df[f'{column}_{pt2}'],
-                                              df[f'is_{pt1}'],
-                                              df[f'is_{pt2}'])
-
-
-            curr_dist *= 1+pitch_distance_df.loc[pt1, pt2]
-            wd_for_pitch.append(curr_dist)
-
-        stacked_matrices = np.stack(wd_for_pitch, axis=0)
-        # Calculate the minimum along the new axis
-        min_matrix = np.min(stacked_matrices, axis=0)
-        
-        weighted_dist += min_matrix
-        
-
-    return weighted_dist
-
-def get_neighbors_pitcher(train_data, select_column, val_columns, meta_columns, pitch_distance_df):
+def get_neighbors_pitcher(train_data, select_column, val_columns, meta_columns, pitch_distance_df, pitch_types):
 
 
     
@@ -150,7 +103,7 @@ def get_neighbors_pitcher(train_data, select_column, val_columns, meta_columns, 
         
         num_rows = len(qdf)
 
-        distance_matrix =  dist_between_pitchers(qdf, pitch_distance_df)
+        distance_matrix =  dist_between_pitchers(qdf, pitch_distance_df, pitch_types)
         knn = NearestNeighbors(n_neighbors=k)
     
         # Fit the model on the data
@@ -294,16 +247,26 @@ def impute_from_neighbors(train_data, train_meta, train_pitches):
          'estimated_woba_using_speedangle_pitcher']
 
     train_data = pd.concat([train_data.reset_index(), train_meta.reset_index()], axis = 1)
+
+    print('before we have', train_pitches.k_pitch_type_adj.unique())
+    train_pitches.k_pitch_type_adj = [None if x in ['nan','None'] else x for x in train_pitches.k_pitch_type_adj]
+
     
     pitches = train_pitches[['k_pitch_type_adj','effective_speed',
-                       'release_spin_rate','armside_horz_break','pfx_z']].dropna()
+                       'release_spin_rate','armside_horz_break','pfx_z']]
+
+    print(pitches)
+    pitches = pitches.dropna()
     
     scaler = MinMaxScaler()
     pitches[['effective_speed', 'release_spin_rate','armside_horz_break','pfx_z']]\
         = scaler.fit_transform(
             pitches[['effective_speed', 'release_spin_rate','armside_horz_break','pfx_z']])
-    
-    pitches = pitches.groupby('k_pitch_type_adj').agg('mean')#.reset_index()
+
+    pitch_types = pitches.k_pitch_type_adj.unique()
+
+    print('putch types are', pitch_types)
+    pitches = pitches.groupby('k_pitch_type_adj').agg('mean')
     
     distances = pdist(pitches, metric='euclidean')
     
@@ -315,7 +278,7 @@ def impute_from_neighbors(train_data, train_meta, train_pitches):
 
     pitcher_vals = [x for x in train_data.columns if '_pitcher' in x or 'pitch_type' in x or 'is_'==x[:3]]
 
-    pitcher_d = get_neighbors_pitcher(train_data,'pitcher', pitcher_vals, meta, distance_df)
+    pitcher_d = get_neighbors_pitcher(train_data,'pitcher', pitcher_vals, meta, distance_df, pitch_types)
     batter_d = get_neighbors_batter(train_data,'batter', batter_vals, meta)
 
 
